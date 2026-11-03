@@ -1,0 +1,20 @@
+{
+  "schemaVersion": 1,
+  "id": "donutbuildbot",
+  "version": "${version}",
+  "name": "DonutSMP BuildBot & EasyPlace",
+  "description": "Auto Build, Easy Place, Custom A*, Auto Order/Sell & Auto Eat",
+  "authors": ["lonbell366"],
+  "environment": "client",
+  "entrypoints": {
+    "client": [
+      "com.buildbot.BuildBotClient"
+    ]
+  },
+  "depends": {
+    "fabricloader": ">=0.16.0",
+    "minecraft": ">=1.21",
+    "java": ">=21",
+    "fabric-api": "*"
+  }
+}
