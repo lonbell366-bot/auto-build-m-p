@@ -22,6 +22,7 @@ import net.minecraft.world.World;
 import org.lwjgl.glfw.GLFW;
 
 import java.lang.reflect.Field;
+import java.lang.reflect.Method;
 import java.util.*;
 import java.util.concurrent.ThreadLocalRandom;
 
@@ -50,22 +51,32 @@ public class BuildBotClient implements ClientModInitializer {
 
         ClientPlayConnectionEvents.JOIN.register((h, s, c) -> {
             if (config.autoResumeEnabled && config.hasSavedOrigin && schematic == null) {
-                try { schematic = SchematicData.loadFromFile(config.activeSchematicName); } catch (Exception ignored) {}
+                try { schematic = SchematicData.loadFromFile(config.activeSchematicName); } catch (Throwable ignored) {}
             }
         });
 
+        // Da xoa world.isClient (field_9236) va boc chong crash 100% cho 1.21.11
         UseBlockCallback.EVENT.register((player, world, hand, hit) -> {
-            if (!world.isClient || !config.easyPlaceEnabled || hand != Hand.MAIN_HAND) return ActionResult.PASS;
-            BlockPos pos = hit.getBlockPos().offset(hit.getSide());
-            BlockState st = getExpectedState(pos);
-            if (st != null && !st.isAir() && world.getBlockState(pos).isAir() && equipItem(MinecraftClient.getInstance(), st)) {
-                AntiSusRotator.placeBlockSmart(MinecraftClient.getInstance(), pos, st, Hand.MAIN_HAND);
-                return ActionResult.SUCCESS;
-            }
+            try {
+                MinecraftClient mc = MinecraftClient.getInstance();
+                if (mc == null || mc.world == null || !config.easyPlaceEnabled || hand != Hand.MAIN_HAND) {
+                    return ActionResult.PASS;
+                }
+                BlockPos pos = hit.getBlockPos().offset(hit.getSide());
+                BlockState st = getExpectedState(pos);
+                if (st != null && !st.isAir() && mc.world.getBlockState(pos).isAir() && equipItem(mc, st)) {
+                    AntiSusRotator.placeBlockSmart(mc, pos, st, Hand.MAIN_HAND);
+                    return ActionResult.SUCCESS;
+                }
+            } catch (Throwable ignored) {}
             return ActionResult.PASS;
         });
 
-        ClientTickEvents.START_CLIENT_TICK.register(this::onTick);
+        ClientTickEvents.START_CLIENT_TICK.register(client -> {
+            try {
+                onTick(client);
+            } catch (Throwable ignored) {}
+        });
     }
 
     private void onTick(MinecraftClient client) {
@@ -169,9 +180,15 @@ public class BuildBotClient implements ClientModInitializer {
 
     public static int getSelectedSlot(PlayerEntity p) {
         try {
-            for (Field f : p.getInventory().getClass().getDeclaredFields()) {
+            Object inv = p.getInventory();
+            for (Method m : inv.getClass().getMethods()) {
+                if (m.getParameterCount() == 0 && m.getReturnType() == int.class && (m.getName().equals("getSelectedSlot") || m.getName().equals("method_67534"))) {
+                    return (int) m.invoke(inv);
+                }
+            }
+            for (Field f : inv.getClass().getDeclaredFields()) {
                 if (f.getType() == int.class && (f.getName().equals("field_7545") || f.getName().equals("selectedSlot"))) {
-                    f.setAccessible(true); return f.getInt(p.getInventory());
+                    f.setAccessible(true); return f.getInt(inv);
                 }
             }
         } catch (Throwable ignored) {}
@@ -179,10 +196,17 @@ public class BuildBotClient implements ClientModInitializer {
     }
 
     public static void setSelectedSlot(PlayerEntity p, int slot) {
+        if (slot < 0 || slot > 8) return;
         try {
-            for (Field f : p.getInventory().getClass().getDeclaredFields()) {
+            Object inv = p.getInventory();
+            for (Method m : inv.getClass().getMethods()) {
+                if (m.getParameterCount() == 1 && m.getParameterTypes()[0] == int.class && (m.getName().equals("setSelectedSlot") || m.getName().equals("method_67533"))) {
+                    m.invoke(inv, slot); return;
+                }
+            }
+            for (Field f : inv.getClass().getDeclaredFields()) {
                 if (f.getType() == int.class && (f.getName().equals("field_7545") || f.getName().equals("selectedSlot"))) {
-                    f.setAccessible(true); f.setInt(p.getInventory(), slot); return;
+                    f.setAccessible(true); f.setInt(inv, slot); return;
                 }
             }
         } catch (Throwable ignored) {}
@@ -237,7 +261,9 @@ public class BuildBotClient implements ClientModInitializer {
 
     public void syncFromLitematica(MinecraftClient c) {
         if (c == null || c.player == null) return;
-        SchematicData cap = SchematicData.captureFromLitematica(c, config);
+        SchematicData cap = null;
+        try { cap = SchematicData.captureFromLitematica(c, config); } catch (Throwable ignored) {}
+        if (cap == null) cap = fallbackScanLitematica(c);
         if (cap != null) {
             schematic = cap; currentLayerY = 0; retryRound = 0;
             c.player.sendMessage(Text.literal("§a[BuildBot] Da nhan Litematica: §e" + SchematicData.getActiveLitematicaName()), false);
@@ -245,6 +271,41 @@ public class BuildBotClient implements ClientModInitializer {
         } else {
             c.player.sendMessage(Text.literal("§c[BuildBot] Khong thay Schem trong Litematica quanh ban!"), false);
         }
+    }
+
+    private SchematicData fallbackScanLitematica(MinecraftClient c) {
+        World lw = SchematicData.getLitematicaWorld();
+        if (lw == null || c.player == null) return null;
+        BlockPos p = c.player.getBlockPos();
+        int r = 48, minX = 99999999, minY = 99999999, minZ = 99999999, maxX = -99999999, maxY = -99999999, maxZ = -99999999;
+        boolean found = false;
+        BlockPos.Mutable m = new BlockPos.Mutable();
+        for (int x = p.getX() - r; x <= p.getX() + r; x++) {
+            for (int y = Math.max(-64, p.getY() - 16); y <= Math.min(319, p.getY() + 48); y++) {
+                for (int z = p.getZ() - r; z <= p.getZ() + r; z++) {
+                    m.set(x, y, z);
+                    if (!lw.getBlockState(m).isAir()) {
+                        found = true;
+                        if (x < minX) minX = x; if (y < minY) minY = y; if (z < minZ) minZ = z;
+                        if (x > maxX) maxX = x; if (y > maxY) maxY = y; if (z > maxZ) maxZ = z;
+                    }
+                }
+            }
+        }
+        if (!found) return null;
+        int w = maxX - minX + 1, h = maxY - minY + 1, l = maxZ - minZ + 1;
+        config.originX = minX; config.originY = minY; config.originZ = minZ; config.hasSavedOrigin = true; config.save();
+        SchematicData data = new SchematicData(w, h, l);
+        for (int x = 0; x < w; x++) {
+            for (int y = 0; y < h; y++) {
+                for (int z = 0; z < l; z++) {
+                    m.set(minX + x, minY + y, minZ + z);
+                    BlockState st = lw.getBlockState(m);
+                    if (!st.isAir()) data.setBlockState(x, y, z, st);
+                }
+            }
+        }
+        return data;
     }
 
     public void loadSchematicAtPlayer(MinecraftClient c) { syncFromLitematica(c); }
@@ -284,4 +345,4 @@ public class BuildBotClient implements ClientModInitializer {
     private void resetDelay() {
         delayTimer = ThreadLocalRandom.current().nextInt(config.minPlaceDelayTicks, config.maxPlaceDelayTicks + 1);
     }
-}
+            }
