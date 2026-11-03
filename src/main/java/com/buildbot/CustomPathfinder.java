@@ -12,11 +12,13 @@ import net.minecraft.util.math.Vec3d;
 
 import java.util.*;
 
+@SuppressWarnings({"unchecked", "rawtypes"})
 public class CustomPathfinder {
-    private List<BlockPos> currentPath = new ArrayList<>();
-    private final Deque<BlockPos> placedBridgeBlocks = new ArrayDeque<>();
+    private List currentPath = new ArrayList();
+    private final Deque placedBridgeBlocks = new ArrayDeque();
     private long moveStartTime = 0;
     private BlockPos currentGoal = null;
+    private boolean isBotMoving = false; // Chi nha phim 1 lan khi bot dung
 
     public void startMovingTo(BlockPos target) {
         this.currentGoal = target;
@@ -28,10 +30,11 @@ public class CustomPathfinder {
     }
 
     public void stopMovement(MinecraftClient client) {
-        if (client.options != null) {
+        if (isBotMoving && client.options != null) {
             client.options.forwardKey.setPressed(false);
             client.options.jumpKey.setPressed(false);
             client.options.sneakKey.setPressed(false);
+            isBotMoving = false;
         }
         currentPath.clear();
         currentGoal = null;
@@ -48,11 +51,11 @@ public class CustomPathfinder {
         }
 
         double distSq = player.squaredDistanceTo(Vec3d.ofCenter(targetPos));
-        if (distSq <= 15.5) {
+        if (distSq <= 16.0) {
             stopMovement(client);
             if (config.reclaimBridgeEnabled && !placedBridgeBlocks.isEmpty()) {
-                BlockPos lastBridge = placedBridgeBlocks.peekLast();
-                if (!lastBridge.equals(player.getBlockPos().down()) && player.squaredDistanceTo(Vec3d.ofCenter(lastBridge)) <= 16.0) {
+                BlockPos lastBridge = (BlockPos) placedBridgeBlocks.peekLast();
+                if (lastBridge != null && !lastBridge.equals(player.getBlockPos().down()) && player.squaredDistanceTo(Vec3d.ofCenter(lastBridge)) <= 16.0) {
                     if (client.interactionManager != null) {
                         client.interactionManager.updateBlockBreakingProgress(lastBridge, Direction.UP);
                         player.swingHand(Hand.MAIN_HAND);
@@ -65,7 +68,8 @@ public class CustomPathfinder {
             return true;
         }
 
-        BlockPos nextStep = currentPath.isEmpty() ? targetPos : currentPath.get(0);
+        isBotMoving = true;
+        BlockPos nextStep = currentPath.isEmpty() ? targetPos : (BlockPos) currentPath.get(0);
         if (player.getBlockPos().getSquaredDistance(nextStep) <= 1.5 && !currentPath.isEmpty()) {
             currentPath.remove(0);
         }
@@ -108,10 +112,10 @@ public class CustomPathfinder {
         return -1;
     }
 
-    private List<BlockPos> computeSimpleAStar(MinecraftClient client, BlockPos start, BlockPos goal) {
-        PriorityQueue<Node> open = new PriorityQueue<>(Comparator.comparingDouble(n -> n.f));
-        Map<BlockPos, Node> allNodes = new HashMap<>();
-        Set<BlockPos> closed = new HashSet<>();
+    private List computeSimpleAStar(MinecraftClient client, BlockPos start, BlockPos goal) {
+        PriorityQueue open = new PriorityQueue(Comparator.comparingDouble(n -> ((Node) n).f));
+        Map allNodes = new HashMap();
+        Set closed = new HashSet();
 
         Node startNode = new Node(start, null, 0, start.getSquaredDistance(goal));
         open.add(startNode);
@@ -119,9 +123,9 @@ public class CustomPathfinder {
 
         int iterations = 0;
         while (!open.isEmpty() && iterations++ < 250) {
-            Node current = open.poll();
+            Node current = (Node) open.poll();
             if (current.pos.getSquaredDistance(goal) <= 9.0) {
-                List<BlockPos> path = new ArrayList<>();
+                List path = new ArrayList();
                 Node curr = current;
                 while (curr != null) {
                     path.add(0, curr.pos);
@@ -141,7 +145,7 @@ public class CustomPathfinder {
                 }
 
                 double gScore = current.g + 1.0;
-                Node nextNode = allNodes.getOrDefault(neighbor, new Node(neighbor, current, Double.MAX_VALUE, 0));
+                Node nextNode = (Node) allNodes.getOrDefault(neighbor, new Node(neighbor, current, Double.MAX_VALUE, 0));
                 if (gScore < nextNode.g) {
                     nextNode.parent = current;
                     nextNode.g = gScore;
@@ -151,7 +155,7 @@ public class CustomPathfinder {
                 }
             }
         }
-        return new ArrayList<>(Collections.singletonList(goal));
+        return new ArrayList(Collections.singletonList(goal));
     }
 
     private static class Node {
@@ -166,4 +170,4 @@ public class CustomPathfinder {
             this.f = f;
         }
     }
-                     }
+}
