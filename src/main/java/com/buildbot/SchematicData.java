@@ -2,12 +2,18 @@ package com.buildbot;
 
 import net.fabricmc.loader.api.FabricLoader;
 import net.minecraft.block.*;
+import net.minecraft.client.MinecraftClient;
 import net.minecraft.registry.Registries;
 import net.minecraft.state.StateManager;
 import net.minecraft.state.property.Property;
 import net.minecraft.util.Identifier;
+import net.minecraft.util.math.BlockPos;
+import net.minecraft.world.World;
+import net.minecraft.world.chunk.Chunk;
+import net.minecraft.world.chunk.ChunkSection;
 
 import java.io.*;
+import java.lang.reflect.Method;
 import java.util.*;
 import java.util.zip.GZIPInputStream;
 
@@ -15,7 +21,7 @@ import java.util.zip.GZIPInputStream;
 public class SchematicData {
     public int width, height, length;
     private final BlockState[][][] blocks;
-    public final Map<Block, Integer> totalMaterials = new HashMap<>();
+    public final Map totalMaterials = new HashMap();
 
     public SchematicData(int width, int height, int length) {
         this.width = width;
@@ -40,9 +46,127 @@ public class SchematicData {
         if (x >= 0 && y >= 0 && z >= 0 && x < width && y < height && z < length) {
             blocks[x][y][z] = state;
             if (!state.isAir() && state.getFluidState().isEmpty()) {
-                totalMaterials.merge(state.getBlock(), 1, Integer::sum);
+                Block b = state.getBlock();
+                int count = totalMaterials.containsKey(b) ? (Integer) totalMaterials.get(b) : 0;
+                totalMaterials.put(b, count + 1);
             }
         }
+    }
+
+    /**
+     * Lay truc tiep the gioi Schematic cua Litematica neu dang mo
+     */
+    public static World getLitematicaWorld() {
+        try {
+            Class handlerClass = Class.forName("fi.dy.masa.litematica.world.SchematicWorldHandler");
+            Method getWorld = handlerClass.getMethod("getSchematicWorld");
+            Object worldObj = getWorld.invoke(null);
+            if (worldObj instanceof World) {
+                return (World) worldObj;
+            }
+        } catch (Throwable ignored) {}
+        return null;
+    }
+
+    /**
+     * Lay ten Schematic ma nguoi choi dang load trong Litematica
+     */
+    public static String getActiveLitematicaName() {
+        try {
+            Class dmClass = Class.forName("fi.dy.masa.litematica.data.DataManager");
+            Object pm = dmClass.getMethod("getSchematicPlacementManager").invoke(null);
+            Collection list = (Collection) pm.getClass().getMethod("getAllSchematicsPlacements").invoke(pm);
+            if (list != null && !list.isEmpty()) {
+                StringBuilder sb = new StringBuilder();
+                for (Object placement : list) {
+                    String name = String.valueOf(placement.getClass().getMethod("getName").invoke(placement));
+                    if (sb.length() > 0) sb.append(", ");
+                    sb.append(name);
+                }
+                return sb.toString();
+            }
+        } catch (Throwable ignored) {}
+        World w = getLitematicaWorld();
+        return (w != null) ? "Litematica (Dang hoat dong)" : "Chua load trong Litematica";
+    }
+
+    /**
+     * Quet truc tiep cac khoi tu Litematica quanh nguoi choi (ban kinh 8 chunks = 128x128 blocks)
+     */
+    public static SchematicData captureFromLitematica(MinecraftClient client, BuildBotConfig config) {
+        World litematicaWorld = getLitematicaWorld();
+        if (litematicaWorld == null || client.player == null) return null;
+
+        BlockPos center = client.player.getBlockPos();
+        int centerChunkX = center.getX() >> 4;
+        int centerChunkZ = center.getZ() >> 4;
+        int radiusChunks = 6; // Quet vung 192x192 quanh nguoi choi
+
+        int minX = Integer.MAX_VALUE, minY = Integer.MAX_VALUE, minZ = Integer.MAX_VALUE;
+        int maxX = Integer.MIN_VALUE, maxY = Integer.MIN_VALUE, maxZ = Integer.MIN_VALUE;
+        boolean foundAny = false;
+
+        for (int cx = centerChunkX - radiusChunks; cx <= centerChunkX + radiusChunks; cx++) {
+            for (int cz = centerChunkZ - radiusChunks; cz <= centerChunkZ + radiusChunks; cz++) {
+                Chunk chunk = litematicaWorld.getChunk(cx, cz);
+                if (chunk == null) continue;
+                ChunkSection[] sections = chunk.getSectionArray();
+                for (int sIdx = 0; sIdx < sections.length; sIdx++) {
+                    ChunkSection sec = sections[sIdx];
+                    if (sec == null || sec.isEmpty()) continue;
+                    int baseY = chunk.sectionIndexToCoord(sIdx) << 4;
+                    int baseX = cx << 4;
+                    int baseZ = cz << 4;
+                    for (int x = 0; x < 16; x++) {
+                        for (int y = 0; y < 16; y++) {
+                            for (int z = 0; z < 16; z++) {
+                                BlockState st = sec.getBlockState(x, y, z);
+                                if (!st.isAir()) {
+                                    foundAny = true;
+                                    int wx = baseX + x;
+                                    int wy = baseY + y;
+                                    int wz = baseZ + z;
+                                    if (wx < minX) minX = wx;
+                                    if (wy < minY) minY = wy;
+                                    if (wz < minZ) minZ = wz;
+                                    if (wx > maxX) maxX = wx;
+                                    if (wy > maxY) maxY = wy;
+                                    if (wz > maxZ) maxZ = wz;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if (!foundAny) return null;
+
+        int w = (maxX - minX) + 1;
+        int h = (maxY - minY) + 1;
+        int l = (maxZ - minZ) + 1;
+
+        config.originX = minX;
+        config.originY = minY;
+        config.originZ = minZ;
+        config.hasSavedOrigin = true;
+        config.activeSchematicName = getActiveLitematicaName();
+        config.save();
+
+        SchematicData data = new SchematicData(w, h, l);
+        BlockPos.Mutable mpos = new BlockPos.Mutable();
+        for (int x = 0; x < w; x++) {
+            for (int y = 0; y < h; y++) {
+                for (int z = 0; z < l; z++) {
+                    mpos.set(minX + x, minY + y, minZ + z);
+                    BlockState st = litematicaWorld.getBlockState(mpos);
+                    if (!st.isAir()) {
+                        data.setBlockState(x, y, z, st);
+                    }
+                }
+            }
+        }
+        return data;
     }
 
     public static int getDependencyOrder(BlockState state) {
@@ -305,8 +429,8 @@ public class SchematicData {
         return state;
     }
 
-    private static <T extends Comparable<T>> BlockState withProperty(BlockState state, Property<T> prop, String value) {
-        Optional<T> parsed = prop.parse(value);
-        return parsed.map(t -> state.with(prop, t)).orElse(state);
+    private static BlockState withProperty(BlockState state, Property prop, String value) {
+        Optional parsed = prop.parse(value);
+        return parsed.isPresent() ? (BlockState) state.with(prop, (Comparable) parsed.get()) : state;
     }
-            }
+                    }
