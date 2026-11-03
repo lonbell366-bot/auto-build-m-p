@@ -88,7 +88,7 @@ public class CustomPathfinder {
             client.options.sneakKey.setPressed(true);
             int cobbleSlot = findCobblestoneInHotbar(player);
             if (cobbleSlot != -1 && client.interactionManager != null) {
-                player.getInventory().selectedSlot = cobbleSlot;
+                BuildBotClient.setSelectedSlot(player, cobbleSlot);
                 BlockHitResult hit = new BlockHitResult(Vec3d.ofCenter(belowNext), Direction.UP, belowNext, false);
                 client.interactionManager.interactBlock(player, Hand.MAIN_HAND, hit);
                 player.swingHand(Hand.MAIN_HAND);
@@ -166,4 +166,4 @@ public class CustomPathfinder {
             this.f = f;
         }
     }
-}
+                     }
