@@ -13,7 +13,7 @@ public class BuildBotScreen extends Screen {
     private TextFieldWidget schemNameField;
 
     public BuildBotScreen(Screen parent) {
-        super(Text.literal("DonutSMP BuildBot & EasyPlace (Menu F10)"));
+        super(Text.literal("DonutSMP BuildBot & EasyPlace (Menu F10 / .bb)"));
         this.parent = parent;
     }
 
@@ -121,7 +121,7 @@ public class BuildBotScreen extends Screen {
             this.close();
         }).dimensions(cx - 155, y, 150, 20).build());
 
-        this.addDrawableChild(ButtonWidget.builder(Text.literal("Luu & Dong (F10)"), btn -> this.close())
+        this.addDrawableChild(ButtonWidget.builder(Text.literal("Luu & Dong"), btn -> this.close())
                 .dimensions(cx + 5, y, 150, 20).build());
     }
 
@@ -132,7 +132,7 @@ public class BuildBotScreen extends Screen {
     @Override
     public void render(DrawContext context, int mouseX, int mouseY, float delta) {
         super.render(context, mouseX, mouseY, delta);
-        context.drawCenteredTextWithShadow(this.textRenderer, this.title, this.width / 2, 8, 0xFFFFFF);
+        context.drawCenteredTextWithShadow(this.textRenderer, this.title, this.width / 2, 8, 0xFFFFFFFF);
     }
 
     @Override
