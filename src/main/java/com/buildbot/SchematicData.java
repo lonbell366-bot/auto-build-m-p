@@ -2,15 +2,14 @@ package com.buildbot;
 
 import net.fabricmc.loader.api.FabricLoader;
 import net.minecraft.block.*;
-import net.minecraft.nbt.*;
 import net.minecraft.registry.Registries;
 import net.minecraft.state.StateManager;
 import net.minecraft.state.property.Property;
 import net.minecraft.util.Identifier;
 
-import java.io.File;
-import java.nio.file.Path;
+import java.io.*;
 import java.util.*;
+import java.util.zip.GZIPInputStream;
 
 public class SchematicData {
     public int width, height, length;
@@ -60,74 +59,128 @@ public class SchematicData {
         return 1;
     }
 
+    @SuppressWarnings("unchecked")
     public static SchematicData loadFromFile(String fileName) throws Exception {
         File schemDir = new File(FabricLoader.getInstance().getGameDir().toFile(), "schematics");
         if (!schemDir.exists()) schemDir.mkdirs();
 
-        Path path = new File(schemDir, fileName).toPath();
-        NbtCompound root = NbtIo.readCompressed(path, NbtSizeTracker.ofUnlimitedBytes());
-
-        if (root.contains("Schematic", NbtElement.COMPOUND_TYPE)) {
-            root = root.getCompound("Schematic");
+        File file = new File(schemDir, fileName);
+        Map<String, Object> root;
+        try (DataInputStream dis = new DataInputStream(new BufferedInputStream(new GZIPInputStream(new FileInputStream(file))))) {
+            byte rootType = dis.readByte();
+            if (rootType != 10) throw new IOException("Root NBT khong phai Compound");
+            dis.readUTF(); // Root name
+            root = (Map<String, Object>) readTagPayload(dis, (byte) 10);
         }
 
-        // 1. Structure Block (.nbt)
-        if (root.contains("size") && root.contains("palette") && root.contains("blocks")) {
+        if (root.containsKey("Schematic") && root.get("Schematic") instanceof Map) {
+            root = (Map<String, Object>) root.get("Schematic");
+        }
+
+        if (root.containsKey("size") && root.containsKey("palette") && root.containsKey("blocks")) {
             return parseVanillaNbt(root);
         }
-        // 2. Sponge Schematic (.schem)
-        if (root.contains("Width") && root.contains("Palette") && root.contains("BlockData")) {
+        if (root.containsKey("Width") && root.containsKey("Palette") && root.containsKey("BlockData")) {
             return parseSpongeSchem(root);
         }
-        // 3. Litematica (.litematic)
-        if (root.contains("Regions")) {
+        if (root.containsKey("Regions")) {
             return parseLitematic(root);
         }
-        // 4. MCEdit Legacy (.schematic)
-        if (root.contains("Width") && root.contains("Blocks")) {
+        if (root.containsKey("Width") && root.containsKey("Blocks")) {
             return parseLegacySchematic(root);
         }
         throw new IllegalArgumentException("Dinh dang khong ho tro: " + fileName);
     }
 
-    private static SchematicData parseVanillaNbt(NbtCompound root) {
-        NbtList sizeList = root.getList("size", NbtElement.INT_TYPE);
-        int w = sizeList.getInt(0);
-        int h = sizeList.getInt(1);
-        int l = sizeList.getInt(2);
+    private static Object readTagPayload(DataInputStream dis, byte type) throws IOException {
+        return switch (type) {
+            case 1 -> dis.readByte();
+            case 2 -> dis.readShort();
+            case 3 -> dis.readInt();
+            case 4 -> dis.readLong();
+            case 5 -> dis.readFloat();
+            case 6 -> dis.readDouble();
+            case 7 -> {
+                int len = dis.readInt();
+                byte[] arr = new byte[len];
+                dis.readFully(arr);
+                yield arr;
+            }
+            case 8 -> dis.readUTF();
+            case 9 -> {
+                byte elemType = dis.readByte();
+                int len = dis.readInt();
+                List<Object> list = new ArrayList<>(Math.max(0, len));
+                for (int i = 0; i < len; i++) {
+                    list.add(readTagPayload(dis, elemType));
+                }
+                yield list;
+            }
+            case 10 -> {
+                Map<String, Object> map = new HashMap<>();
+                while (true) {
+                    byte nextType = dis.readByte();
+                    if (nextType == 0) break;
+                    String key = dis.readUTF();
+                    map.put(key, readTagPayload(dis, nextType));
+                }
+                yield map;
+            }
+            case 11 -> {
+                int len = dis.readInt();
+                int[] arr = new int[len];
+                for (int i = 0; i < len; i++) arr[i] = dis.readInt();
+                yield arr;
+            }
+            case 12 -> {
+                int len = dis.readInt();
+                long[] arr = new long[len];
+                for (int i = 0; i < len; i++) arr[i] = dis.readLong();
+                yield arr;
+            }
+            default -> throw new IOException("Unknown NBT tag type: " + type);
+        };
+    }
+
+    @SuppressWarnings("unchecked")
+    private static SchematicData parseVanillaNbt(Map<String, Object> root) {
+        List<Object> sizeList = (List<Object>) root.get("size");
+        int w = ((Number) sizeList.get(0)).intValue();
+        int h = ((Number) sizeList.get(1)).intValue();
+        int l = ((Number) sizeList.get(2)).intValue();
         SchematicData data = new SchematicData(w, h, l);
 
-        NbtList paletteNbt = root.getList("palette", NbtElement.COMPOUND_TYPE);
+        List> paletteList = (List>) root.get("palette");
         List<BlockState> palette = new ArrayList<>();
-        for (int i = 0; i < paletteNbt.size(); i++) {
-            palette.add(readStateFromNbt(paletteNbt.getCompound(i)));
+        for (Map<String, Object> entry : paletteList) {
+            palette.add(readStateFromMap(entry));
         }
 
-        NbtList blocksNbt = root.getList("blocks", NbtElement.COMPOUND_TYPE);
-        for (int i = 0; i < blocksNbt.size(); i++) {
-            NbtCompound b = blocksNbt.getCompound(i);
-            NbtList pos = b.getList("pos", NbtElement.INT_TYPE);
-            int stateIdx = b.getInt("state");
+        List> blocksList = (List>) root.get("blocks");
+        for (Map<String, Object> b : blocksList) {
+            List<Object> pos = (List<Object>) b.get("pos");
+            int stateIdx = ((Number) b.get("state")).intValue();
             if (stateIdx >= 0 && stateIdx < palette.size()) {
-                data.setBlockState(pos.getInt(0), pos.getInt(1), pos.getInt(2), palette.get(stateIdx));
+                data.setBlockState(((Number) pos.get(0)).intValue(), ((Number) pos.get(1)).intValue(), ((Number) pos.get(2)).intValue(), palette.get(stateIdx));
             }
         }
         return data;
     }
 
-    private static SchematicData parseSpongeSchem(NbtCompound root) {
-        int w = root.getShort("Width");
-        int h = root.getShort("Height");
-        int l = root.getShort("Length");
+    @SuppressWarnings("unchecked")
+    private static SchematicData parseSpongeSchem(Map<String, Object> root) {
+        int w = ((Number) root.get("Width")).intValue();
+        int h = ((Number) root.get("Height")).intValue();
+        int l = ((Number) root.get("Length")).intValue();
         SchematicData data = new SchematicData(w, h, l);
 
-        NbtCompound paletteTag = root.getCompound("Palette");
+        Map<String, Object> paletteTag = (Map<String, Object>) root.get("Palette");
         Map<Integer, BlockState> palette = new HashMap<>();
-        for (String key : paletteTag.getKeys()) {
-            palette.put(paletteTag.getInt(key), parseBlockStateString(key));
+        for (Map.Entry<String, Object> entry : paletteTag.entrySet()) {
+            palette.put(((Number) entry.getValue()).intValue(), parseBlockStateString(entry.getKey()));
         }
 
-        byte[] blockData = root.getByteArray("BlockData");
+        byte[] blockData = (byte[]) root.get("BlockData");
         int index = 0;
         int i = 0;
         while (i < blockData.length && index < w * h * l) {
@@ -142,31 +195,30 @@ public class SchematicData {
             int y = index / (w * l);
             int z = (index % (w * l)) / w;
             int x = (index % (w * l)) % w;
-            BlockState state = palette.getOrDefault(value, Blocks.AIR.getDefaultState());
-            data.setBlockState(x, y, z, state);
+            data.setBlockState(x, y, z, palette.getOrDefault(value, Blocks.AIR.getDefaultState()));
             index++;
         }
         return data;
     }
 
-    private static SchematicData parseLitematic(NbtCompound root) {
-        NbtCompound regions = root.getCompound("Regions");
-        String firstRegionKey = regions.getKeys().iterator().next();
-        NbtCompound region = regions.getCompound(firstRegionKey);
+    @SuppressWarnings("unchecked")
+    private static SchematicData parseLitematic(Map<String, Object> root) {
+        Map<String, Object> regions = (Map<String, Object>) root.get("Regions");
+        Map<String, Object> region = (Map<String, Object>) regions.values().iterator().next();
 
-        NbtCompound sizeTag = region.getCompound("Size");
-        int w = Math.abs(sizeTag.getInt("x"));
-        int h = Math.abs(sizeTag.getInt("y"));
-        int l = Math.abs(sizeTag.getInt("z"));
+        Map<String, Object> sizeTag = (Map<String, Object>) region.get("Size");
+        int w = Math.abs(((Number) sizeTag.get("x")).intValue());
+        int h = Math.abs(((Number) sizeTag.get("y")).intValue());
+        int l = Math.abs(((Number) sizeTag.get("z")).intValue());
         SchematicData data = new SchematicData(w, h, l);
 
-        NbtList paletteNbt = region.getList("BlockStatePalette", NbtElement.COMPOUND_TYPE);
+        List> paletteList = (List>) region.get("BlockStatePalette");
         List<BlockState> palette = new ArrayList<>();
-        for (int i = 0; i < paletteNbt.size(); i++) {
-            palette.add(readStateFromNbt(paletteNbt.getCompound(i)));
+        for (Map<String, Object> entry : paletteList) {
+            palette.add(readStateFromMap(entry));
         }
 
-        long[] blockStates = region.getLongArray("BlockStates");
+        long[] blockStates = (long[]) region.get("BlockStates");
         int bitsPerBlock = Math.max(2, Integer.SIZE - Integer.numberOfLeadingZeros(palette.size() - 1));
         long maxEntryValue = (1L << bitsPerBlock) - 1L;
         int totalBlocks = w * h * l;
@@ -196,34 +248,34 @@ public class SchematicData {
         return data;
     }
 
-    private static SchematicData parseLegacySchematic(NbtCompound root) {
-        int w = root.getShort("Width");
-        int h = root.getShort("Height");
-        int l = root.getShort("Length");
+    private static SchematicData parseLegacySchematic(Map<String, Object> root) {
+        int w = ((Number) root.get("Width")).intValue();
+        int h = ((Number) root.get("Height")).intValue();
+        int l = ((Number) root.get("Length")).intValue();
         SchematicData data = new SchematicData(w, h, l);
-        byte[] blockIds = root.getByteArray("Blocks");
+        byte[] blockIds = (byte[]) root.get("Blocks");
         for (int index = 0; index < blockIds.length && index < w * h * l; index++) {
             int id = blockIds[index] & 0xFF;
             int y = index / (w * l);
             int z = (index % (w * l)) / w;
             int x = (index % (w * l)) % w;
-            BlockState state = (id == 0) ? Blocks.AIR.getDefaultState() : Blocks.COBBLESTONE.getDefaultState();
-            data.setBlockState(x, y, z, state);
+            data.setBlockState(x, y, z, (id == 0) ? Blocks.AIR.getDefaultState() : Blocks.COBBLESTONE.getDefaultState());
         }
         return data;
     }
 
-    private static BlockState readStateFromNbt(NbtCompound tag) {
-        String name = tag.getString("Name");
+    @SuppressWarnings("unchecked")
+    private static BlockState readStateFromMap(Map<String, Object> tag) {
+        String name = (String) tag.get("Name");
         Block block = Registries.BLOCK.get(Identifier.of(name));
         BlockState state = block.getDefaultState();
-        if (tag.contains("Properties", NbtElement.COMPOUND_TYPE)) {
-            NbtCompound props = tag.getCompound("Properties");
+        if (tag.containsKey("Properties") && tag.get("Properties") instanceof Map) {
+            Map<String, Object> props = (Map<String, Object>) tag.get("Properties");
             StateManager<Block, BlockState> manager = block.getStateManager();
-            for (String key : props.getKeys()) {
-                Property<?> prop = manager.getProperty(key);
+            for (Map.Entry<String, Object> entry : props.entrySet()) {
+                Property<?> prop = manager.getProperty(entry.getKey());
                 if (prop != null) {
-                    state = withProperty(state, prop, props.getString(key));
+                    state = withProperty(state, prop, String.valueOf(entry.getValue()));
                 }
             }
         }
@@ -255,5 +307,5 @@ public class SchematicData {
         Optional<T> parsed = prop.parse(value);
         return parsed.map(t -> state.with(prop, t)).orElse(state);
     }
-            }
+                }
                           
