@@ -4,37 +4,38 @@ import net.minecraft.client.gui.DrawContext;
 import net.minecraft.client.gui.screen.Screen;
 import net.minecraft.client.gui.widget.ButtonWidget;
 import net.minecraft.client.gui.widget.SliderWidget;
-import net.minecraft.client.gui.widget.TextFieldWidget;
 import net.minecraft.text.Text;
 
 public class BuildBotScreen extends Screen {
     private final Screen parent;
     private final BuildBotConfig config = BuildBotClient.config;
-    private TextFieldWidget schemNameField;
+    private String currentLitematicaStatus = "";
 
     public BuildBotScreen(Screen parent) {
-        super(Text.literal("DonutSMP BuildBot & EasyPlace (Menu F10 / .bb)"));
+        super(Text.literal("DonutSMP BuildBot & EasyPlace (F10 / .bb)"));
         this.parent = parent;
     }
 
     @Override
     protected void init() {
         int cx = this.width / 2;
-        int y = 22;
+        int y = 26;
 
-        schemNameField = new TextFieldWidget(this.textRenderer, cx - 155, y, 195, 20, Text.literal("Ten file Schem"));
-        schemNameField.setText(config.activeSchematicName);
-        this.addDrawableChild(schemNameField);
+        currentLitematicaStatus = SchematicData.getActiveLitematicaName();
 
-        this.addDrawableChild(ButtonWidget.builder(Text.literal("§bNap Schem & Neo"), btn -> {
-            config.activeSchematicName = schemNameField.getText().trim();
-            config.save();
-            BuildBotClient.INSTANCE.loadSchematicAtPlayer(this.client);
-        }).dimensions(cx + 45, y, 110, 20).build());
+        // Nut tu dong nhan Schematic dang mo trong Litematica
+        this.addDrawableChild(ButtonWidget.builder(Text.literal("§bTu Nhan Schem Tu Litematica: §e" + currentLitematicaStatus), btn -> {
+            BuildBotClient.INSTANCE.syncFromLitematica(this.client);
+            currentLitematicaStatus = SchematicData.getActiveLitematicaName();
+            btn.setMessage(Text.literal("§bTu Nhan Schem Tu Litematica: §e" + currentLitematicaStatus));
+        }).dimensions(cx - 155, y, 310, 20).build());
 
         y += 24;
         this.addDrawableChild(ButtonWidget.builder(toggleText("Auto Build", config.autoBuildEnabled), btn -> {
             config.autoBuildEnabled = !config.autoBuildEnabled;
+            if (config.autoBuildEnabled) {
+                BuildBotClient.INSTANCE.syncFromLitematica(this.client);
+            }
             btn.setMessage(toggleText("Auto Build", config.autoBuildEnabled));
             config.save();
         }).dimensions(cx - 155, y, 150, 20).build());
