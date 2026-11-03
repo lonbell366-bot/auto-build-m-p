@@ -2,7 +2,6 @@ package com.buildbot;
 
 import net.fabricmc.api.ClientModInitializer;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
-import net.fabricmc.fabric.api.client.keybinding.v1.KeyBindingHelper;
 import net.fabricmc.fabric.api.client.message.v1.ClientSendMessageEvents;
 import net.fabricmc.fabric.api.client.networking.v1.ClientPlayConnectionEvents;
 import net.fabricmc.fabric.api.event.player.UseBlockCallback;
@@ -10,9 +9,8 @@ import net.minecraft.block.*;
 import net.minecraft.block.enums.ComparatorMode;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.network.ClientPlayerEntity;
-import net.minecraft.client.option.KeyBinding;
-import net.minecraft.client.util.InputUtil;
 import net.minecraft.component.DataComponentTypes;
+import net.minecraft.entity.player.PlayerEntity;
 import net.minecraft.item.Item;
 import net.minecraft.item.ItemStack;
 import net.minecraft.item.Items;
@@ -28,6 +26,7 @@ import net.minecraft.util.math.Direction;
 import net.minecraft.util.math.Vec3d;
 import org.lwjgl.glfw.GLFW;
 
+import java.lang.reflect.Field;
 import java.util.*;
 import java.util.concurrent.ThreadLocalRandom;
 
@@ -43,21 +42,17 @@ public class BuildBotClient implements ClientModInitializer {
     private int retryRound = 0;
     private int actionDelayTimer = 0;
     private boolean openGuiNextTick = false;
-
-    private KeyBinding f10MenuKey;
+    private boolean wasF10Pressed = false;
 
     @Override
     public void onInitializeClient() {
         INSTANCE = this;
         config = BuildBotConfig.load();
 
-        f10MenuKey = KeyBindingHelper.registerKeyBinding(new KeyBinding(
-                "Mo Bang Dieu Khien BuildBot (F10)", InputUtil.Type.KEYSYM, GLFW.GLFW_KEY_F10, "DonutSMP BuildBot"
-        ));
-
+        // Mo bang dieu khien bang lenh chat .bb hoac #bb (Ho tro ca PC & Dien thoai)
         ClientSendMessageEvents.ALLOW_CHAT.register(msg -> {
             String clean = msg.trim();
-            if (clean.equalsIgnoreCase(".bb") || clean.equalsIgnoreCase("#bb")) {
+            if (clean.equalsIgnoreCase(".bb") || clean.equalsIgnoreCase("#bb") || clean.equalsIgnoreCase(".ae")) {
                 openGuiNextTick = true;
                 return false;
             }
@@ -77,6 +72,7 @@ public class BuildBotClient implements ClientModInitializer {
             }
         });
 
+        // Easy Place: Tu dong chon khoi & xoay huong chuan khi dat khoi trong vung Schematic
         UseBlockCallback.EVENT.register((player, world, hand, hitResult) -> {
             if (!world.isClient || !config.easyPlaceEnabled || schematic == null || hand != Hand.MAIN_HAND) {
                 return ActionResult.PASS;
@@ -100,14 +96,13 @@ public class BuildBotClient implements ClientModInitializer {
         ClientPlayerEntity player = client.player;
         if (player == null || client.world == null) return;
 
+        // Kiem tra phim F10 truc tiep qua GLFW (Khong dung class_304 de tuong thich 100% voi 1.21.11)
+        checkF10KeyPress(client);
+
         if (openGuiNextTick && client.currentScreen == null) {
             openGuiNextTick = false;
             client.setScreen(new BuildBotScreen(null));
             return;
-        }
-
-        while (f10MenuKey.wasPressed()) {
-            client.setScreen(new BuildBotScreen(client.currentScreen));
         }
 
         if (orderSellManager.isBusy()) {
@@ -134,6 +129,46 @@ public class BuildBotClient implements ClientModInitializer {
         }
 
         runBuildLayerTick(client, player);
+    }
+
+    private void checkF10KeyPress(MinecraftClient client) {
+        try {
+            long handle = GLFW.glfwGetCurrentContext();
+            if (handle != 0L) {
+                boolean pressed = GLFW.glfwGetKey(handle, GLFW.GLFW_KEY_F10) == GLFW.GLFW_PRESS;
+                if (pressed && !wasF10Pressed && client.currentScreen == null) {
+                    client.setScreen(new BuildBotScreen(null));
+                }
+                wasF10Pressed = pressed;
+            }
+        } catch (Throwable ignored) {}
+    }
+
+    public static int getSelectedSlot(PlayerEntity player) {
+        try {
+            Object inv = player.getInventory();
+            for (Field f : inv.getClass().getDeclaredFields()) {
+                if (f.getType() == int.class && (f.getName().equals("field_7545") || f.getName().equals("selectedSlot"))) {
+                    f.setAccessible(true);
+                    return f.getInt(inv);
+                }
+            }
+        } catch (Throwable ignored) {}
+        return 0;
+    }
+
+    public static void setSelectedSlot(PlayerEntity player, int slot) {
+        if (slot < 0 || slot > 8) return;
+        try {
+            Object inv = player.getInventory();
+            for (Field f : inv.getClass().getDeclaredFields()) {
+                if (f.getType() == int.class && (f.getName().equals("field_7545") || f.getName().equals("selectedSlot"))) {
+                    f.setAccessible(true);
+                    f.setInt(inv, slot);
+                    return;
+                }
+            }
+        } catch (Throwable ignored) {}
     }
 
     private void runBuildLayerTick(MinecraftClient client, ClientPlayerEntity player) {
@@ -274,10 +309,11 @@ public class BuildBotClient implements ClientModInitializer {
         ClientPlayerEntity player = client.player;
         if (player == null) return false;
 
+        int currentSlot = getSelectedSlot(player);
         for (int i = 0; i < 9; i++) {
             if (player.getInventory().getStack(i).isOf(targetItem)) {
-                if (player.getInventory().selectedSlot != i) {
-                    player.getInventory().selectedSlot = i;
+                if (currentSlot != i) {
+                    setSelectedSlot(player, i);
                     player.networkHandler.sendPacket(new UpdateSelectedSlotC2SPacket(i));
                 }
                 return true;
@@ -286,12 +322,11 @@ public class BuildBotClient implements ClientModInitializer {
 
         for (int i = 9; i < 36; i++) {
             if (player.getInventory().getStack(i).isOf(targetItem)) {
-                int hotbarSlot = player.getInventory().selectedSlot;
                 if (client.interactionManager != null) {
                     client.interactionManager.clickSlot(
-                            player.playerScreenHandler.syncId, i, hotbarSlot, SlotActionType.SWAP, player
+                            player.playerScreenHandler.syncId, i, currentSlot, SlotActionType.SWAP, player
                     );
-                    player.networkHandler.sendPacket(new UpdateSelectedSlotC2SPacket(hotbarSlot));
+                    player.networkHandler.sendPacket(new UpdateSelectedSlotC2SPacket(currentSlot));
                     return true;
                 }
             }
@@ -309,7 +344,7 @@ public class BuildBotClient implements ClientModInitializer {
         for (int i = 0; i < 9; i++) {
             ItemStack stack = player.getInventory().getStack(i);
             if (stack.contains(DataComponentTypes.FOOD) && !stack.isOf(Items.ROTTEN_FLESH) && !stack.isOf(Items.SPIDER_EYE)) {
-                player.getInventory().selectedSlot = i;
+                setSelectedSlot(player, i);
                 client.options.useKey.setPressed(true);
                 if (!player.isUsingItem() && client.interactionManager != null) {
                     client.interactionManager.interactItem(player, Hand.MAIN_HAND);
@@ -405,5 +440,5 @@ public class BuildBotClient implements ClientModInitializer {
     private void resetRandomDelay() {
         actionDelayTimer = ThreadLocalRandom.current().nextInt(config.minPlaceDelayTicks, config.maxPlaceDelayTicks + 1);
     }
-                                      }
-                  
+            }
+                                     
