@@ -6,85 +6,61 @@ import net.fabricmc.fabric.api.client.message.v1.ClientSendMessageEvents;
 import net.fabricmc.fabric.api.client.networking.v1.ClientPlayConnectionEvents;
 import net.fabricmc.fabric.api.event.player.UseBlockCallback;
 import net.minecraft.block.*;
-import net.minecraft.block.enums.ComparatorMode;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.network.ClientPlayerEntity;
 import net.minecraft.component.DataComponentTypes;
 import net.minecraft.entity.player.PlayerEntity;
-import net.minecraft.item.Item;
-import net.minecraft.item.ItemStack;
-import net.minecraft.item.Items;
+import net.minecraft.item.*;
 import net.minecraft.network.packet.c2s.play.UpdateSelectedSlotC2SPacket;
 import net.minecraft.screen.slot.SlotActionType;
 import net.minecraft.state.property.Properties;
 import net.minecraft.text.Text;
-import net.minecraft.util.ActionResult;
-import net.minecraft.util.Hand;
+import net.minecraft.util.*;
 import net.minecraft.util.hit.BlockHitResult;
-import net.minecraft.util.math.BlockPos;
-import net.minecraft.util.math.Direction;
-import net.minecraft.util.math.Vec3d;
+import net.minecraft.util.math.*;
+import net.minecraft.world.World;
 import org.lwjgl.glfw.GLFW;
 
 import java.lang.reflect.Field;
 import java.util.*;
 import java.util.concurrent.ThreadLocalRandom;
 
+@SuppressWarnings({"unchecked", "rawtypes"})
 public class BuildBotClient implements ClientModInitializer {
     public static BuildBotClient INSTANCE;
     public static BuildBotConfig config;
 
     private SchematicData schematic = null;
     private final CustomPathfinder pathfinder = new CustomPathfinder();
-    private final OrderAndSellManager orderSellManager = new OrderAndSellManager();
-
-    private int currentLayerY = 0;
-    private int retryRound = 0;
-    private int actionDelayTimer = 0;
-    private boolean openGuiNextTick = false;
-    private boolean wasF10Pressed = false;
+    private final OrderAndSellManager orderSell = new OrderAndSellManager();
+    private int currentLayerY = 0, retryRound = 0, delayTimer = 0;
+    private boolean openGui = false, wasF10 = false, isBotEating = false;
 
     @Override
     public void onInitializeClient() {
         INSTANCE = this;
         config = BuildBotConfig.load();
 
-        // Mo bang dieu khien bang lenh chat .bb hoac #bb (Ho tro ca PC & Dien thoai)
         ClientSendMessageEvents.ALLOW_CHAT.register(msg -> {
-            String clean = msg.trim();
-            if (clean.equalsIgnoreCase(".bb") || clean.equalsIgnoreCase("#bb") || clean.equalsIgnoreCase(".ae")) {
-                openGuiNextTick = true;
-                return false;
-            }
-            if (clean.toLowerCase().startsWith("/buildbot automine ")) {
-                config.autoMineEnabled = clean.toLowerCase().endsWith("on");
-                config.save();
-                return false;
-            }
+            String s = msg.trim().toLowerCase();
+            if (s.equals(".bb") || s.equals("#bb") || s.equals(".ae")) { openGui = true; return false; }
+            if (s.startsWith("/buildbot automine ")) { config.autoMineEnabled = s.endsWith("on"); config.save(); return false; }
             return true;
         });
 
-        ClientPlayConnectionEvents.JOIN.register((handler, sender, client) -> {
+        ClientPlayConnectionEvents.JOIN.register((h, s, c) -> {
             if (config.autoResumeEnabled && config.hasSavedOrigin && schematic == null) {
-                try {
-                    schematic = SchematicData.loadFromFile(config.activeSchematicName);
-                } catch (Exception ignored) {}
+                try { schematic = SchematicData.loadFromFile(config.activeSchematicName); } catch (Exception ignored) {}
             }
         });
 
-        // Easy Place: Tu dong chon khoi & xoay huong chuan khi dat khoi trong vung Schematic
-        UseBlockCallback.EVENT.register((player, world, hand, hitResult) -> {
-            if (!world.isClient || !config.easyPlaceEnabled || schematic == null || hand != Hand.MAIN_HAND) {
-                return ActionResult.PASS;
-            }
-            BlockPos placePos = hitResult.getBlockPos().offset(hitResult.getSide());
-            BlockState targetState = getExpectedStateAtWorldPos(placePos);
-            if (targetState != null && !targetState.isAir()) {
-                MinecraftClient client = MinecraftClient.getInstance();
-                if (equipItemForState(client, targetState)) {
-                    AntiSusRotator.placeBlockSmart(client, placePos, targetState, Hand.MAIN_HAND);
-                    return ActionResult.SUCCESS;
-                }
+        UseBlockCallback.EVENT.register((player, world, hand, hit) -> {
+            if (!world.isClient || !config.easyPlaceEnabled || hand != Hand.MAIN_HAND) return ActionResult.PASS;
+            BlockPos pos = hit.getBlockPos().offset(hit.getSide());
+            BlockState st = getExpectedState(pos);
+            if (st != null && !st.isAir() && world.getBlockState(pos).isAir() && equipItem(MinecraftClient.getInstance(), st)) {
+                AntiSusRotator.placeBlockSmart(MinecraftClient.getInstance(), pos, st, Hand.MAIN_HAND);
+                return ActionResult.SUCCESS;
             }
             return ActionResult.PASS;
         });
@@ -96,349 +72,216 @@ public class BuildBotClient implements ClientModInitializer {
         ClientPlayerEntity player = client.player;
         if (player == null || client.world == null) return;
 
-        // Kiem tra phim F10 truc tiep qua GLFW (Khong dung class_304 de tuong thich 100% voi 1.21.11)
-        checkF10KeyPress(client);
-
-        if (openGuiNextTick && client.currentScreen == null) {
-            openGuiNextTick = false;
-            client.setScreen(new BuildBotScreen(null));
-            return;
-        }
-
-        if (orderSellManager.isBusy()) {
-            orderSellManager.tick(client, config);
-            return;
-        }
-
-        if (client.currentScreen != null) return;
-
-        if (config.autoEatEnabled && handleAutoEat(client, player)) {
-            return;
-        }
-
-        orderSellManager.checkAndStartAutoSell(client, config);
-
-        if (!config.autoBuildEnabled || schematic == null) {
-            pathfinder.stopMovement(client);
-            return;
-        }
-
-        if (actionDelayTimer > 0) {
-            actionDelayTimer--;
-            return;
-        }
-
-        runBuildLayerTick(client, player);
-    }
-
-    private void checkF10KeyPress(MinecraftClient client) {
         try {
-            long handle = GLFW.glfwGetCurrentContext();
-            if (handle != 0L) {
-                boolean pressed = GLFW.glfwGetKey(handle, GLFW.GLFW_KEY_F10) == GLFW.GLFW_PRESS;
-                if (pressed && !wasF10Pressed && client.currentScreen == null) {
-                    client.setScreen(new BuildBotScreen(null));
-                }
-                wasF10Pressed = pressed;
+            long win = GLFW.glfwGetCurrentContext();
+            if (win != 0L) {
+                boolean p = GLFW.glfwGetKey(win, GLFW.GLFW_KEY_F10) == GLFW.GLFW_PRESS;
+                if (p && !wasF10 && client.currentScreen == null) client.setScreen(new BuildBotScreen(null));
+                wasF10 = p;
             }
         } catch (Throwable ignored) {}
+
+        if (openGui && client.currentScreen == null) { openGui = false; client.setScreen(new BuildBotScreen(null)); return; }
+        if (orderSell.isBusy()) { orderSell.tick(client, config); return; }
+        if (client.currentScreen != null) return;
+        if (config.autoEatEnabled && handleAutoEat(client, player)) return;
+
+        orderSell.checkAndStartAutoSell(client, config);
+
+        if (config.autoBuildEnabled && schematic == null) {
+            syncFromLitematica(client);
+            if (schematic == null) { config.autoBuildEnabled = false; return; }
+        }
+        if (!config.autoBuildEnabled || schematic == null) { pathfinder.stopMovement(client); return; }
+        if (delayTimer > 0) { delayTimer--; return; }
+
+        runBuildTick(client, player);
     }
 
-    public static int getSelectedSlot(PlayerEntity player) {
+    private void runBuildTick(MinecraftClient client, ClientPlayerEntity player) {
+        if (currentLayerY >= schematic.height) {
+            config.autoBuildEnabled = false; config.save(); pathfinder.stopMovement(client);
+            player.sendMessage(Text.literal("§a[BuildBot] Da hoan thanh cong trinh!"), false);
+            return;
+        }
+
+        List list = new ArrayList();
+        for (int dy = 0; dy < config.layerHeight && (currentLayerY + dy) < schematic.height; dy++) {
+            int y = currentLayerY + dy;
+            for (int x = 0; x < schematic.width; x++) {
+                for (int z = 0; z < schematic.length; z++) {
+                    BlockPos wp = new BlockPos(config.originX + x, config.originY + y, config.originZ + z);
+                    BlockState exp = getExpectedState(wp);
+                    if (!isMatching(client.world.getBlockState(wp), exp)) {
+                        if (retryRound < config.maxRetryRounds - 1 && !hasSupport(client, wp) && !exp.isAir()) continue;
+                        list.add(wp);
+                    }
+                }
+            }
+        }
+
+        if (list.isEmpty()) {
+            currentLayerY += config.layerHeight; retryRound = 0;
+            player.sendMessage(Text.literal("§b[BuildBot] Len tang Y = " + currentLayerY), true);
+            return;
+        }
+
+        list.sort(Comparator.comparingInt(p -> SchematicData.getDependencyOrder(getExpectedState((BlockPos) p)))
+                .thenComparingDouble(p -> player.squaredDistanceTo(Vec3d.ofCenter((BlockPos) p))));
+
+        BlockPos pos = (BlockPos) list.get(0);
+        BlockState exp = getExpectedState(pos);
+        BlockState act = client.world.getBlockState(pos);
+
+        if (!pathfinder.tickMoveToTarget(client, pos, config)) {
+            if (pathfinder.isTimedOut(config.moveTimeoutSeconds)) retryRound++;
+            return;
+        }
+
+        if (!act.isAir() && !act.getFluidState().isStill()) {
+            if (act.isOf(exp.getBlock()) && ((act.getBlock() instanceof RepeaterBlock && !Objects.equals(act.get(Properties.DELAY), exp.get(Properties.DELAY)))
+                    || (act.getBlock() instanceof ComparatorBlock && act.get(Properties.COMPARATOR_MODE) != exp.get(Properties.COMPARATOR_MODE)))) {
+                client.interactionManager.interactBlock(player, Hand.MAIN_HAND, new BlockHitResult(Vec3d.ofCenter(pos), Direction.UP, pos, false));
+                resetDelay(); return;
+            }
+            if (config.autoMineEnabled && client.interactionManager != null) {
+                client.interactionManager.updateBlockBreakingProgress(pos, Direction.UP);
+                player.swingHand(Hand.MAIN_HAND);
+            }
+            return;
+        }
+
+        if (exp.isAir()) return;
+        if (!equipItem(client, exp)) {
+            if (config.autoOrderEnabled && getItem(exp) != Items.AIR) orderSell.startOrderFetch(client, getItem(exp), 32);
+            return;
+        }
+
+        float[] rot = AntiSusRotator.getRequiredRotationForState(pos, exp, player);
+        if (config.smoothLookAntiSus && !AntiSusRotator.stepSmoothRotation(client, rot[0], rot[1], config.smoothRotationSpeed)) return;
+
+        AntiSusRotator.placeBlockSmart(client, pos, exp, Hand.MAIN_HAND);
+        if (exp.contains(Properties.WATERLOGGED) && exp.get(Properties.WATERLOGGED) && equipRawItem(client, Items.WATER_BUCKET)) {
+            client.interactionManager.interactBlock(player, Hand.MAIN_HAND, new BlockHitResult(Vec3d.ofCenter(pos), Direction.UP, pos, false));
+        }
+        resetDelay();
+    }
+
+    public static int getSelectedSlot(PlayerEntity p) {
         try {
-            Object inv = player.getInventory();
-            for (Field f : inv.getClass().getDeclaredFields()) {
+            for (Field f : p.getInventory().getClass().getDeclaredFields()) {
                 if (f.getType() == int.class && (f.getName().equals("field_7545") || f.getName().equals("selectedSlot"))) {
-                    f.setAccessible(true);
-                    return f.getInt(inv);
+                    f.setAccessible(true); return f.getInt(p.getInventory());
                 }
             }
         } catch (Throwable ignored) {}
         return 0;
     }
 
-    public static void setSelectedSlot(PlayerEntity player, int slot) {
-        if (slot < 0 || slot > 8) return;
+    public static void setSelectedSlot(PlayerEntity p, int slot) {
         try {
-            Object inv = player.getInventory();
-            for (Field f : inv.getClass().getDeclaredFields()) {
+            for (Field f : p.getInventory().getClass().getDeclaredFields()) {
                 if (f.getType() == int.class && (f.getName().equals("field_7545") || f.getName().equals("selectedSlot"))) {
-                    f.setAccessible(true);
-                    f.setInt(inv, slot);
-                    return;
+                    f.setAccessible(true); f.setInt(p.getInventory(), slot); return;
                 }
             }
         } catch (Throwable ignored) {}
     }
 
-    private void runBuildLayerTick(MinecraftClient client, ClientPlayerEntity player) {
-        if (currentLayerY >= schematic.height) {
-            config.autoBuildEnabled = false;
-            config.save();
-            pathfinder.stopMovement(client);
-            player.sendMessage(Text.literal("§a[BuildBot] Da hoan thanh 100% cong trinh!"), false);
-            return;
-        }
-
-        List<BlockPos> candidates = new ArrayList<>();
-        for (int dy = 0; dy < config.layerHeight && (currentLayerY + dy) < schematic.height; dy++) {
-            int y = currentLayerY + dy;
-            for (int x = 0; x < schematic.width; x++) {
-                for (int z = 0; z < schematic.length; z++) {
-                    BlockState target = schematic.getBlockState(x, y, z);
-                    BlockPos worldPos = new BlockPos(config.originX + x, config.originY + y, config.originZ + z);
-                    BlockState actual = client.world.getBlockState(worldPos);
-
-                    if (!isBlockMatching(actual, target)) {
-                        if (retryRound < config.maxRetryRounds - 1 && !hasNeighborSupport(client, worldPos) && !target.isAir()) {
-                            continue;
-                        }
-                        candidates.add(worldPos);
-                    }
-                }
-            }
-        }
-
-        if (candidates.isEmpty()) {
-            if (hasAnyRemainingInLayer(client, currentLayerY) && retryRound < config.maxRetryRounds) {
-                retryRound++;
-                return;
-            }
-            retryRound = 0;
-            currentLayerY += config.layerHeight;
-            player.sendMessage(Text.literal("§b[BuildBot] Xong tang! Chuyen len tang Y = " + currentLayerY), true);
-            return;
-        }
-
-        candidates.sort(Comparator
-                .comparingInt((BlockPos p) -> SchematicData.getDependencyOrder(getExpectedStateAtWorldPos(p)))
-                .thenComparingDouble(p -> player.squaredDistanceTo(Vec3d.ofCenter(p))));
-
-        BlockPos targetPos = candidates.get(0);
-        BlockState expectedState = getExpectedStateAtWorldPos(targetPos);
-        BlockState currentWorldState = client.world.getBlockState(targetPos);
-
-        if (!pathfinder.tickMoveToTarget(client, targetPos, config)) {
-            if (pathfinder.isTimedOut(config.moveTimeoutSeconds)) {
-                player.sendMessage(Text.literal("§e[BuildBot] Qua 20s khong toi duoc " + targetPos.toShortString() + ", chuyen khoi khac."), true);
-                retryRound++;
-            }
-            return;
-        }
-
-        if (!currentWorldState.isAir() && !currentWorldState.getFluidState().isStill()) {
-            if (currentWorldState.isOf(expectedState.getBlock()) && tuneRedstoneComponent(client, player, targetPos, currentWorldState, expectedState)) {
-                resetRandomDelay();
-                return;
-            }
-            if (config.autoMineEnabled && client.interactionManager != null) {
-                float[] angles = AntiSusRotator.getRequiredRotationForState(targetPos, expectedState, player);
-                if (config.smoothLookAntiSus && !AntiSusRotator.stepSmoothRotation(client, angles[0], angles[1], config.smoothRotationSpeed)) {
-                    return;
-                }
-                client.interactionManager.updateBlockBreakingProgress(targetPos, Direction.UP);
-                player.swingHand(Hand.MAIN_HAND);
-            }
-            return;
-        }
-
-        if (expectedState.isAir()) return;
-
-        if (!equipItemForState(client, expectedState)) {
-            if (config.autoOrderEnabled) {
-                Item neededItem = getItemForState(expectedState);
-                if (neededItem != Items.AIR) {
-                    int missingCount = countMissingInCurrentLayer(client, neededItem);
-                    orderSellManager.startOrderFetch(client, neededItem, missingCount + 16);
-                }
-            }
-            return;
-        }
-
-        float[] reqAngles = AntiSusRotator.getRequiredRotationForState(targetPos, expectedState, player);
-        if (config.smoothLookAntiSus && !AntiSusRotator.stepSmoothRotation(client, reqAngles[0], reqAngles[1], config.smoothRotationSpeed)) {
-            return;
-        }
-
-        AntiSusRotator.placeBlockSmart(client, targetPos, expectedState, Hand.MAIN_HAND);
-
-        if (expectedState.contains(Properties.WATERLOGGED) && expectedState.get(Properties.WATERLOGGED)) {
-            if (equipSpecificItem(client, Items.WATER_BUCKET) && client.interactionManager != null) {
-                client.interactionManager.interactBlock(player, Hand.MAIN_HAND,
-                        new BlockHitResult(Vec3d.ofCenter(targetPos), Direction.UP, targetPos, false));
-            }
-        }
-
-        resetRandomDelay();
+    private Item getItem(BlockState s) {
+        if (s.isOf(Blocks.WATER)) return Items.WATER_BUCKET;
+        if (s.isOf(Blocks.LAVA)) return Items.LAVA_BUCKET;
+        if (s.isOf(Blocks.REDSTONE_WIRE)) return Items.REDSTONE;
+        return s.getBlock().asItem();
     }
 
-    private boolean tuneRedstoneComponent(MinecraftClient client, ClientPlayerEntity player, BlockPos pos, BlockState actual, BlockState expected) {
-        if (actual.getBlock() instanceof RepeaterBlock) {
-            if (!Objects.equals(actual.get(Properties.DELAY), expected.get(Properties.DELAY))) {
-                client.interactionManager.interactBlock(player, Hand.MAIN_HAND,
-                        new BlockHitResult(Vec3d.ofCenter(pos), Direction.UP, pos, false));
-                player.swingHand(Hand.MAIN_HAND);
-                return true;
-            }
-        } else if (actual.getBlock() instanceof ComparatorBlock) {
-            ComparatorMode actMode = actual.get(Properties.COMPARATOR_MODE);
-            ComparatorMode expMode = expected.get(Properties.COMPARATOR_MODE);
-            if (actMode != expMode) {
-                client.interactionManager.interactBlock(player, Hand.MAIN_HAND,
-                        new BlockHitResult(Vec3d.ofCenter(pos), Direction.UP, pos, false));
-                player.swingHand(Hand.MAIN_HAND);
-                return true;
-            }
-        }
-        return false;
+    private boolean equipItem(MinecraftClient c, BlockState s) {
+        Item i = getItem(s); return i != Items.AIR && equipRawItem(c, i);
     }
 
-    private boolean equipItemForState(MinecraftClient client, BlockState state) {
-        Item item = getItemForState(state);
-        return item != Items.AIR && equipSpecificItem(client, item);
-    }
-
-    private Item getItemForState(BlockState state) {
-        if (state.isOf(Blocks.WATER)) return Items.WATER_BUCKET;
-        if (state.isOf(Blocks.LAVA)) return Items.LAVA_BUCKET;
-        if (state.isOf(Blocks.REDSTONE_WIRE)) return Items.REDSTONE;
-        return state.getBlock().asItem();
-    }
-
-    private boolean equipSpecificItem(MinecraftClient client, Item targetItem) {
-        ClientPlayerEntity player = client.player;
-        if (player == null) return false;
-
-        int currentSlot = getSelectedSlot(player);
+    private boolean equipRawItem(MinecraftClient c, Item item) {
+        ClientPlayerEntity p = c.player;
+        if (p == null) return false;
+        int cur = getSelectedSlot(p);
         for (int i = 0; i < 9; i++) {
-            if (player.getInventory().getStack(i).isOf(targetItem)) {
-                if (currentSlot != i) {
-                    setSelectedSlot(player, i);
-                    player.networkHandler.sendPacket(new UpdateSelectedSlotC2SPacket(i));
-                }
+            if (p.getInventory().getStack(i).isOf(item)) {
+                if (cur != i) { setSelectedSlot(p, i); p.networkHandler.sendPacket(new UpdateSelectedSlotC2SPacket(i)); }
                 return true;
             }
         }
-
         for (int i = 9; i < 36; i++) {
-            if (player.getInventory().getStack(i).isOf(targetItem)) {
-                if (client.interactionManager != null) {
-                    client.interactionManager.clickSlot(
-                            player.playerScreenHandler.syncId, i, currentSlot, SlotActionType.SWAP, player
-                    );
-                    player.networkHandler.sendPacket(new UpdateSelectedSlotC2SPacket(currentSlot));
-                    return true;
-                }
+            if (p.getInventory().getStack(i).isOf(item) && c.interactionManager != null) {
+                c.interactionManager.clickSlot(p.playerScreenHandler.syncId, i, cur, SlotActionType.SWAP, p);
+                p.networkHandler.sendPacket(new UpdateSelectedSlotC2SPacket(cur));
+                return true;
             }
         }
         return false;
     }
 
-    private boolean handleAutoEat(MinecraftClient client, ClientPlayerEntity player) {
-        if (player.getHungerManager().getFoodLevel() > config.hungerThreshold) {
-            if (player.isUsingItem() && player.getMainHandStack().contains(DataComponentTypes.FOOD)) {
-                client.options.useKey.setPressed(false);
-            }
+    private boolean handleAutoEat(MinecraftClient c, ClientPlayerEntity p) {
+        if (p.getHungerManager().getFoodLevel() > config.hungerThreshold) {
+            if (isBotEating) { c.options.useKey.setPressed(false); isBotEating = false; }
             return false;
         }
         for (int i = 0; i < 9; i++) {
-            ItemStack stack = player.getInventory().getStack(i);
-            if (stack.contains(DataComponentTypes.FOOD) && !stack.isOf(Items.ROTTEN_FLESH) && !stack.isOf(Items.SPIDER_EYE)) {
-                setSelectedSlot(player, i);
-                client.options.useKey.setPressed(true);
-                if (!player.isUsingItem() && client.interactionManager != null) {
-                    client.interactionManager.interactItem(player, Hand.MAIN_HAND);
-                }
+            ItemStack s = p.getInventory().getStack(i);
+            if (s.contains(DataComponentTypes.FOOD) && !s.isOf(Items.ROTTEN_FLESH) && !s.isOf(Items.SPIDER_EYE)) {
+                isBotEating = true; setSelectedSlot(p, i); c.options.useKey.setPressed(true);
+                if (!p.isUsingItem() && c.interactionManager != null) c.interactionManager.interactItem(p, Hand.MAIN_HAND);
                 return true;
             }
         }
         return false;
     }
 
-    public void loadSchematicAtPlayer(MinecraftClient client) {
-        if (client == null || client.player == null) return;
-        try {
-            schematic = SchematicData.loadFromFile(config.activeSchematicName);
-            BlockPos p = client.player.getBlockPos();
-            config.originX = p.getX();
-            config.originY = p.getY();
-            config.originZ = p.getZ();
-            config.hasSavedOrigin = true;
-            config.save();
-            currentLayerY = 0;
-            retryRound = 0;
-            client.player.sendMessage(Text.literal("§a[BuildBot] Da nap " + config.activeSchematicName + " (" + schematic.width + "x" + schematic.height + "x" + schematic.length + ") tai " + p.toShortString()), false);
-            printMaterialList(client);
-        } catch (Exception e) {
-            client.player.sendMessage(Text.literal("§c[BuildBot] Loi nap Schematic: " + e.getMessage()), false);
+    public void syncFromLitematica(MinecraftClient c) {
+        if (c == null || c.player == null) return;
+        SchematicData cap = SchematicData.captureFromLitematica(c, config);
+        if (cap != null) {
+            schematic = cap; currentLayerY = 0; retryRound = 0;
+            c.player.sendMessage(Text.literal("§a[BuildBot] Da nhan Litematica: §e" + SchematicData.getActiveLitematicaName()), false);
+            printMaterialList(c);
+        } else {
+            c.player.sendMessage(Text.literal("§c[BuildBot] Khong thay Schem trong Litematica quanh ban!"), false);
         }
     }
 
-    public void printMaterialList(MinecraftClient client) {
-        if (client == null || client.player == null || schematic == null) return;
-        client.player.sendMessage(Text.literal("§6=== Danh Sach Vat Lieu Can Dung ==="), false);
-        for (Map.Entry<Block, Integer> entry : schematic.totalMaterials.entrySet()) {
-            Item item = entry.getKey().asItem();
-            int have = OrderAndSellManager.countItemInInventory(client.player, item);
-            int need = entry.getValue();
-            String color = (have >= need) ? "§a" : "§c";
-            client.player.sendMessage(Text.literal("§f- " + entry.getKey().getName().getString() + ": " + color + have + "/" + need), false);
+    public void loadSchematicAtPlayer(MinecraftClient c) { syncFromLitematica(c); }
+
+    public void printMaterialList(MinecraftClient c) {
+        if (c == null || c.player == null || schematic == null) return;
+        c.player.sendMessage(Text.literal("§6=== Danh Sach Vat Lieu ==="), false);
+        for (Object o : schematic.totalMaterials.entrySet()) {
+            Map.Entry e = (Map.Entry) o; Block b = (Block) e.getKey(); int need = (Integer) e.getValue();
+            int have = OrderAndSellManager.countItemInInventory(c.player, b.asItem());
+            c.player.sendMessage(Text.literal("§f- " + b.getName().getString() + ": " + (have >= need ? "§a" : "§c") + have + "/" + need), false);
         }
     }
 
-    private BlockState getExpectedStateAtWorldPos(BlockPos worldPos) {
-        if (schematic == null) return null;
-        int rx = worldPos.getX() - config.originX;
-        int ry = worldPos.getY() - config.originY;
-        int rz = worldPos.getZ() - config.originZ;
-        return schematic.getBlockState(rx, ry, rz);
+    private BlockState getExpectedState(BlockPos wp) {
+        World lw = SchematicData.getLitematicaWorld();
+        if (lw != null) {
+            BlockState ls = lw.getBlockState(wp);
+            if (ls != null && !ls.isAir()) return ls;
+        }
+        return schematic == null ? Blocks.AIR.getDefaultState() : schematic.getBlockState(wp.getX() - config.originX, wp.getY() - config.originY, wp.getZ() - config.originZ);
     }
 
-    private boolean isBlockMatching(BlockState actual, BlockState expected) {
-        if (expected == null) return true;
-        if (expected.isAir()) return actual.isAir();
-        if (!actual.isOf(expected.getBlock())) return false;
-        if (expected.contains(Properties.FACING) && actual.get(Properties.FACING) != expected.get(Properties.FACING)) return false;
-        if (expected.contains(Properties.HORIZONTAL_FACING) && actual.get(Properties.HORIZONTAL_FACING) != expected.get(Properties.HORIZONTAL_FACING)) return false;
-        if (expected.contains(Properties.DELAY) && !Objects.equals(actual.get(Properties.DELAY), expected.get(Properties.DELAY))) return false;
-        if (expected.contains(Properties.COMPARATOR_MODE) && actual.get(Properties.COMPARATOR_MODE) != expected.get(Properties.COMPARATOR_MODE)) return false;
+    private boolean isMatching(BlockState a, BlockState e) {
+        if (e == null || e.isAir()) return a.isAir();
+        if (!a.isOf(e.getBlock())) return false;
+        if (e.contains(Properties.FACING) && a.get(Properties.FACING) != e.get(Properties.FACING)) return false;
+        if (e.contains(Properties.HORIZONTAL_FACING) && a.get(Properties.HORIZONTAL_FACING) != e.get(Properties.HORIZONTAL_FACING)) return false;
         return true;
     }
 
-    private boolean hasNeighborSupport(MinecraftClient client, BlockPos pos) {
-        for (Direction dir : Direction.values()) {
-            if (!client.world.getBlockState(pos.offset(dir)).isAir()) return true;
-        }
+    private boolean hasSupport(MinecraftClient c, BlockPos pos) {
+        for (Direction d : Direction.values()) if (!c.world.getBlockState(pos.offset(d)).isAir()) return true;
         return false;
     }
 
-    private boolean hasAnyRemainingInLayer(MinecraftClient client, int y) {
-        for (int x = 0; x < schematic.width; x++) {
-            for (int z = 0; z < schematic.length; z++) {
-                BlockState exp = schematic.getBlockState(x, y, z);
-                BlockPos wp = new BlockPos(config.originX + x, config.originY + y, config.originZ + z);
-                if (!isBlockMatching(client.world.getBlockState(wp), exp)) return true;
-            }
-        }
-        return false;
+    private void resetDelay() {
+        delayTimer = ThreadLocalRandom.current().nextInt(config.minPlaceDelayTicks, config.maxPlaceDelayTicks + 1);
     }
-
-    private int countMissingInCurrentLayer(MinecraftClient client, Item item) {
-        int missing = 0;
-        for (int x = 0; x < schematic.width; x++) {
-            for (int z = 0; z < schematic.length; z++) {
-                BlockState exp = schematic.getBlockState(x, currentLayerY, z);
-                BlockPos wp = new BlockPos(config.originX + x, config.originY + currentLayerY, config.originZ + z);
-                if (!isBlockMatching(client.world.getBlockState(wp), exp) && getItemForState(exp) == item) {
-                    missing++;
-                }
-            }
-        }
-        return Math.max(1, missing);
-    }
-
-    private void resetRandomDelay() {
-        actionDelayTimer = ThreadLocalRandom.current().nextInt(config.minPlaceDelayTicks, config.maxPlaceDelayTicks + 1);
-    }
-            }
-                                     
+}
