@@ -11,6 +11,7 @@ import java.io.*;
 import java.util.*;
 import java.util.zip.GZIPInputStream;
 
+@SuppressWarnings({"unchecked", "rawtypes"})
 public class SchematicData {
     public int width, height, length;
     private final BlockState[][][] blocks;
@@ -59,22 +60,21 @@ public class SchematicData {
         return 1;
     }
 
-    @SuppressWarnings("unchecked")
     public static SchematicData loadFromFile(String fileName) throws Exception {
         File schemDir = new File(FabricLoader.getInstance().getGameDir().toFile(), "schematics");
         if (!schemDir.exists()) schemDir.mkdirs();
 
         File file = new File(schemDir, fileName);
-        Map<String, Object> root;
+        Map root;
         try (DataInputStream dis = new DataInputStream(new BufferedInputStream(new GZIPInputStream(new FileInputStream(file))))) {
             byte rootType = dis.readByte();
             if (rootType != 10) throw new IOException("Root NBT khong phai Compound");
-            dis.readUTF(); // Root name
-            root = (Map<String, Object>) readTagPayload(dis, (byte) 10);
+            dis.readUTF();
+            root = (Map) readTagPayload(dis, (byte) 10);
         }
 
         if (root.containsKey("Schematic") && root.get("Schematic") instanceof Map) {
-            root = (Map<String, Object>) root.get("Schematic");
+            root = (Map) root.get("Schematic");
         }
 
         if (root.containsKey("size") && root.containsKey("palette") && root.containsKey("blocks")) {
@@ -110,14 +110,14 @@ public class SchematicData {
             case 9 -> {
                 byte elemType = dis.readByte();
                 int len = dis.readInt();
-                List<Object> list = new ArrayList<>(Math.max(0, len));
+                List list = new ArrayList(Math.max(0, len));
                 for (int i = 0; i < len; i++) {
                     list.add(readTagPayload(dis, elemType));
                 }
                 yield list;
             }
             case 10 -> {
-                Map<String, Object> map = new HashMap<>();
+                Map map = new HashMap();
                 while (true) {
                     byte nextType = dis.readByte();
                     if (nextType == 0) break;
@@ -142,42 +142,44 @@ public class SchematicData {
         };
     }
 
-    @SuppressWarnings("unchecked")
-    private static SchematicData parseVanillaNbt(Map<String, Object> root) {
-        List<Object> sizeList = (List<Object>) root.get("size");
+    private static SchematicData parseVanillaNbt(Map root) {
+        List sizeList = (List) root.get("size");
         int w = ((Number) sizeList.get(0)).intValue();
         int h = ((Number) sizeList.get(1)).intValue();
         int l = ((Number) sizeList.get(2)).intValue();
         SchematicData data = new SchematicData(w, h, l);
 
-        List> paletteList = (List>) root.get("palette");
-        List<BlockState> palette = new ArrayList<>();
-        for (Map<String, Object> entry : paletteList) {
-            palette.add(readStateFromMap(entry));
+        List paletteList = (List) root.get("palette");
+        List palette = new ArrayList();
+        for (Object obj : paletteList) {
+            palette.add(readStateFromMap((Map) obj));
         }
 
-        List> blocksList = (List>) root.get("blocks");
-        for (Map<String, Object> b : blocksList) {
-            List<Object> pos = (List<Object>) b.get("pos");
+        List blocksList = (List) root.get("blocks");
+        for (Object obj : blocksList) {
+            Map b = (Map) obj;
+            List pos = (List) b.get("pos");
             int stateIdx = ((Number) b.get("state")).intValue();
             if (stateIdx >= 0 && stateIdx < palette.size()) {
-                data.setBlockState(((Number) pos.get(0)).intValue(), ((Number) pos.get(1)).intValue(), ((Number) pos.get(2)).intValue(), palette.get(stateIdx));
+                BlockState st = (BlockState) palette.get(stateIdx);
+                data.setBlockState(((Number) pos.get(0)).intValue(), ((Number) pos.get(1)).intValue(), ((Number) pos.get(2)).intValue(), st);
             }
         }
         return data;
     }
 
-    @SuppressWarnings("unchecked")
-    private static SchematicData parseSpongeSchem(Map<String, Object> root) {
+    private static SchematicData parseSpongeSchem(Map root) {
         int w = ((Number) root.get("Width")).intValue();
         int h = ((Number) root.get("Height")).intValue();
         int l = ((Number) root.get("Length")).intValue();
         SchematicData data = new SchematicData(w, h, l);
 
-        Map<String, Object> paletteTag = (Map<String, Object>) root.get("Palette");
-        Map<Integer, BlockState> palette = new HashMap<>();
-        for (Map.Entry<String, Object> entry : paletteTag.entrySet()) {
-            palette.put(((Number) entry.getValue()).intValue(), parseBlockStateString(entry.getKey()));
+        Map paletteTag = (Map) root.get("Palette");
+        Map palette = new HashMap();
+        for (Object k : paletteTag.keySet()) {
+            String keyStr = String.valueOf(k);
+            int val = ((Number) paletteTag.get(k)).intValue();
+            palette.put(val, parseBlockStateString(keyStr));
         }
 
         byte[] blockData = (byte[]) root.get("BlockData");
@@ -195,27 +197,27 @@ public class SchematicData {
             int y = index / (w * l);
             int z = (index % (w * l)) / w;
             int x = (index % (w * l)) % w;
-            data.setBlockState(x, y, z, palette.getOrDefault(value, Blocks.AIR.getDefaultState()));
+            BlockState st = (BlockState) palette.getOrDefault(value, Blocks.AIR.getDefaultState());
+            data.setBlockState(x, y, z, st);
             index++;
         }
         return data;
     }
 
-    @SuppressWarnings("unchecked")
-    private static SchematicData parseLitematic(Map<String, Object> root) {
-        Map<String, Object> regions = (Map<String, Object>) root.get("Regions");
-        Map<String, Object> region = (Map<String, Object>) regions.values().iterator().next();
+    private static SchematicData parseLitematic(Map root) {
+        Map regions = (Map) root.get("Regions");
+        Map region = (Map) regions.values().iterator().next();
 
-        Map<String, Object> sizeTag = (Map<String, Object>) region.get("Size");
+        Map sizeTag = (Map) region.get("Size");
         int w = Math.abs(((Number) sizeTag.get("x")).intValue());
         int h = Math.abs(((Number) sizeTag.get("y")).intValue());
         int l = Math.abs(((Number) sizeTag.get("z")).intValue());
         SchematicData data = new SchematicData(w, h, l);
 
-        List> paletteList = (List>) region.get("BlockStatePalette");
-        List<BlockState> palette = new ArrayList<>();
-        for (Map<String, Object> entry : paletteList) {
-            palette.add(readStateFromMap(entry));
+        List paletteList = (List) region.get("BlockStatePalette");
+        List palette = new ArrayList();
+        for (Object obj : paletteList) {
+            palette.add(readStateFromMap((Map) obj));
         }
 
         long[] blockStates = (long[]) region.get("BlockStates");
@@ -242,13 +244,13 @@ public class SchematicData {
             int z = (index % (w * l)) / w;
             int x = (index % (w * l)) % w;
             if ((int) val >= 0 && (int) val < palette.size()) {
-                data.setBlockState(x, y, z, palette.get((int) val));
+                data.setBlockState(x, y, z, (BlockState) palette.get((int) val));
             }
         }
         return data;
     }
 
-    private static SchematicData parseLegacySchematic(Map<String, Object> root) {
+    private static SchematicData parseLegacySchematic(Map root) {
         int w = ((Number) root.get("Width")).intValue();
         int h = ((Number) root.get("Height")).intValue();
         int l = ((Number) root.get("Length")).intValue();
@@ -264,18 +266,18 @@ public class SchematicData {
         return data;
     }
 
-    @SuppressWarnings("unchecked")
-    private static BlockState readStateFromMap(Map<String, Object> tag) {
-        String name = (String) tag.get("Name");
+    private static BlockState readStateFromMap(Map tag) {
+        String name = String.valueOf(tag.get("Name"));
         Block block = Registries.BLOCK.get(Identifier.of(name));
         BlockState state = block.getDefaultState();
         if (tag.containsKey("Properties") && tag.get("Properties") instanceof Map) {
-            Map<String, Object> props = (Map<String, Object>) tag.get("Properties");
-            StateManager<Block, BlockState> manager = block.getStateManager();
-            for (Map.Entry<String, Object> entry : props.entrySet()) {
-                Property<?> prop = manager.getProperty(entry.getKey());
+            Map props = (Map) tag.get("Properties");
+            StateManager manager = block.getStateManager();
+            for (Object k : props.keySet()) {
+                String propName = String.valueOf(k);
+                Property prop = manager.getProperty(propName);
                 if (prop != null) {
-                    state = withProperty(state, prop, String.valueOf(entry.getValue()));
+                    state = withProperty(state, prop, String.valueOf(props.get(k)));
                 }
             }
         }
@@ -289,11 +291,11 @@ public class SchematicData {
         BlockState state = block.getDefaultState();
         if (bracket != -1 && raw.endsWith("]")) {
             String propStr = raw.substring(bracket + 1, raw.length() - 1);
-            StateManager<Block, BlockState> manager = block.getStateManager();
+            StateManager manager = block.getStateManager();
             for (String pair : propStr.split(",")) {
                 String[] kv = pair.split("=");
                 if (kv.length == 2) {
-                    Property<?> prop = manager.getProperty(kv[0].trim());
+                    Property prop = manager.getProperty(kv[0].trim());
                     if (prop != null) {
                         state = withProperty(state, prop, kv[1].trim());
                     }
@@ -307,5 +309,4 @@ public class SchematicData {
         Optional<T> parsed = prop.parse(value);
         return parsed.map(t -> state.with(prop, t)).orElse(state);
     }
-                }
-                          
+            }
