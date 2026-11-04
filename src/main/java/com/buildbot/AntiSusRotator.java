@@ -7,6 +7,7 @@ import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.network.ClientPlayerEntity;
 import net.minecraft.network.packet.c2s.play.HandSwingC2SPacket;
 import net.minecraft.state.property.Properties;
+import net.minecraft.util.ActionResult;
 import net.minecraft.util.Hand;
 import net.minecraft.util.hit.BlockHitResult;
 import net.minecraft.util.math.*;
@@ -48,14 +49,10 @@ public class AntiSusRotator {
         return (float) (f * f * f * 1.2);
     }
 
-    /**
-     * Tim khoi ran xung quanh lam diem tua that su de khong bi Ghost Block (AirPlace)
-     */
     public static BlockHitResult findValidPlaceHit(MinecraftClient client, BlockPos targetPos, BlockState targetState) {
         if (client.world == null || client.player == null) return null;
         Block block = targetState.getBlock();
 
-        // 1. Neu la Hopper: Uu tien bam vao khoi nam o huong voi Hopper tro toi
         if (block instanceof HopperBlock && targetState.contains(Properties.HOPPER_FACING)) {
             Direction outDir = targetState.get(Properties.HOPPER_FACING);
             BlockPos support = targetPos.offset(outDir);
@@ -65,7 +62,6 @@ public class AntiSusRotator {
             }
         }
 
-        // 2. Quet 6 huong xung quanh de tim khoi ran lam diem tua (Uu tien mat duoi DOWN truoc)
         Direction[] order = new Direction[]{Direction.DOWN, Direction.NORTH, Direction.SOUTH, Direction.EAST, Direction.WEST, Direction.UP};
         BlockPos bestSupport = null;
         Direction bestFace = Direction.UP;
@@ -80,7 +76,6 @@ public class AntiSusRotator {
             Vec3d faceCenter = Vec3d.ofCenter(neighbor).add(Vec3d.of(clickFace.getVector()).multiply(0.5));
             double d = eye.squaredDistanceTo(faceCenter);
 
-            // Uu tien khoi khong phai la Ruong/Hopper de tranh mo GUI
             if (!isInteractiveBlock(client.world.getBlockState(neighbor).getBlock())) {
                 d -= 10.0;
             }
