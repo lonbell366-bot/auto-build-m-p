@@ -5,7 +5,6 @@ import net.minecraft.block.enums.BlockHalf;
 import net.minecraft.block.enums.SlabType;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.network.ClientPlayerEntity;
-import net.minecraft.network.packet.c2s.play.HandSwingC2SPacket;
 import net.minecraft.state.property.Properties;
 import net.minecraft.util.ActionResult;
 import net.minecraft.util.Hand;
@@ -16,6 +15,9 @@ import java.util.concurrent.ThreadLocalRandom;
 
 public class AntiSusRotator {
 
+    /**
+     * Xoay dau nhanh (Snap-Smooth) + GCD Fix: Vay tam trong 1-2 ticks ma khong bi GrimAC bat
+     */
     public static boolean stepSmoothRotation(MinecraftClient client, float targetY, float targetP, float speed) {
         ClientPlayerEntity player = client.player;
         if (player == null) return true;
@@ -25,22 +27,26 @@ public class AntiSusRotator {
         float diffYaw = MathHelper.wrapDegrees(targetY - currentYaw);
         float diffPitch = targetP - currentPitch;
 
-        if (Math.abs(diffYaw) < 1.6f && Math.abs(diffPitch) < 1.6f) {
+        if (Math.abs(diffYaw) < 2.5f && Math.abs(diffPitch) < 2.5f) {
             return true;
         }
 
-        float humanNoise = (ThreadLocalRandom.current().nextFloat() - 0.5f) * 0.25f;
-        float factor = MathHelper.clamp(speed + humanNoise * 0.1f, 0.15f, 0.85f);
-        float stepYaw = diffYaw * factor + humanNoise;
-        float stepPitch = diffPitch * factor + humanNoise;
+        // Cho phep vay tam nhanh toi da 95 do / tick + nhieu vi mo (Micro-Jitter) nhu chuot that
+        float maxStep = 95.0f;
+        float jitter = (ThreadLocalRandom.current().nextFloat() - 0.5f) * 0.4f;
+        float stepYaw = MathHelper.clamp(diffYaw * 0.85f, -maxStep, maxStep) + jitter;
+        float stepPitch = MathHelper.clamp(diffPitch * 0.85f, -maxStep, maxStep) + jitter;
 
         float gcd = getMouseGCD(client);
-        stepYaw -= (stepYaw % gcd);
-        stepPitch -= (stepPitch % gcd);
+        if (gcd > 0.0001f) {
+            stepYaw -= (stepYaw % gcd);
+            stepPitch -= (stepPitch % gcd);
+        }
 
         player.setYaw(currentYaw + stepYaw);
         player.setPitch(MathHelper.clamp(currentPitch + stepPitch, -90.0f, 90.0f));
-        return false;
+        return Math.abs(MathHelper.wrapDegrees(targetY - player.getYaw())) < 3.0f
+                && Math.abs(targetP - player.getPitch()) < 3.0f;
     }
 
     private static float getMouseGCD(MinecraftClient client) {
@@ -53,15 +59,16 @@ public class AntiSusRotator {
         if (client.world == null || client.player == null) return null;
         Block block = targetState.getBlock();
 
+        // 1. Hopper: Bam truc tiep vao mat khoi ma day phễu (output) tro vao
         if (block instanceof HopperBlock && targetState.contains(Properties.HOPPER_FACING)) {
             Direction outDir = targetState.get(Properties.HOPPER_FACING);
             BlockPos support = targetPos.offset(outDir);
             if (isSolidSupport(client, support)) {
-                Direction clickFace = outDir.getOpposite();
-                return buildHitResult(support, clickFace, targetState);
+                return buildHitResult(support, outDir.getOpposite(), targetState);
             }
         }
 
+        // 2. Tim khoi ran xung quanh lam diem tua
         Direction[] order = new Direction[]{Direction.DOWN, Direction.NORTH, Direction.SOUTH, Direction.EAST, Direction.WEST, Direction.UP};
         BlockPos bestSupport = null;
         Direction bestFace = Direction.UP;
@@ -75,9 +82,10 @@ public class AntiSusRotator {
             Direction clickFace = dir.getOpposite();
             Vec3d faceCenter = Vec3d.ofCenter(neighbor).add(Vec3d.of(clickFace.getVector()).multiply(0.5));
             double d = eye.squaredDistanceTo(faceCenter);
+            if (d > 21.0) continue; // Ngoai tam voi 4.5 blocks
 
             if (!isInteractiveBlock(client.world.getBlockState(neighbor).getBlock())) {
-                d -= 10.0;
+                d -= 8.0;
             }
             if (d < bestDist) {
                 bestDist = d;
@@ -86,10 +94,7 @@ public class AntiSusRotator {
             }
         }
 
-        if (bestSupport != null) {
-            return buildHitResult(bestSupport, bestFace, targetState);
-        }
-        return null;
+        return bestSupport != null ? buildHitResult(bestSupport, bestFace, targetState) : null;
     }
 
     private static BlockHitResult buildHitResult(BlockPos supportPos, Direction clickFace, BlockState targetState) {
@@ -114,7 +119,15 @@ public class AntiSusRotator {
         return b instanceof BlockWithEntity || b instanceof AbstractRedstoneGateBlock
                 || b instanceof DoorBlock || b instanceof TrapdoorBlock
                 || b instanceof FenceGateBlock || b instanceof CraftingTableBlock
-                || b instanceof AnvilBlock || b instanceof LeverBlock || b instanceof ButtonBlock;
+                || b instanceof AnvilBlock || b instanceof LeverBlock || b instanceof ButtonBlock
+                || b instanceof HopperBlock || b instanceof ObserverBlock;
+    }
+
+    public static boolean requiresSneakToPlace(MinecraftClient client, BlockPos targetPos, BlockState targetState) {
+        BlockHitResult hit = findValidPlaceHit(client, targetPos, targetState);
+        if (hit == null || client.world == null) return false;
+        Block supportBlock = client.world.getBlockState(hit.getBlockPos()).getBlock();
+        return isInteractiveBlock(supportBlock) || (targetState.getBlock() instanceof HopperBlock);
     }
 
     public static float[] getRequiredRotationForState(BlockPos pos, BlockState targetState, ClientPlayerEntity player) {
@@ -149,29 +162,18 @@ public class AntiSusRotator {
         ClientPlayerEntity player = client.player;
         if (player == null || client.interactionManager == null || client.world == null) return false;
 
+        // Khong dat khoi neu nhan vat dang dung de len chinh o do (tranh Ghost Block)
+        if (!targetState.getCollisionShape(client.world, targetPos).isEmpty()
+                && player.getBoundingBox().intersects(new Box(targetPos))) {
+            return false;
+        }
+
         BlockHitResult hitResult = findValidPlaceHit(client, targetPos, targetState);
         if (hitResult == null) return false;
 
-        Block supportBlock = client.world.getBlockState(hitResult.getBlockPos()).getBlock();
-        boolean needSneak = isInteractiveBlock(supportBlock) || (targetState.getBlock() instanceof HopperBlock);
-
-        boolean wasSneaking = client.options.sneakKey.isPressed();
-        if (needSneak && !wasSneaking) {
-            client.options.sneakKey.setPressed(true);
-            player.setSneaking(true);
-        }
-
         ActionResult res = client.interactionManager.interactBlock(player, hand, hitResult);
-        if (res.isAccepted()) {
-            player.swingHand(hand);
-        } else {
-            player.networkHandler.sendPacket(new HandSwingC2SPacket(hand));
-        }
-
-        if (needSneak && !wasSneaking) {
-            client.options.sneakKey.setPressed(false);
-        }
-        return true;
+        player.swingHand(hand);
+        return res.isAccepted() || !client.world.getBlockState(targetPos).isAir();
     }
 
     private static float[] directionToAngles(Direction dir) {
