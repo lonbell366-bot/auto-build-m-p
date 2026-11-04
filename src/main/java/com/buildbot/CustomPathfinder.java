@@ -30,6 +30,8 @@ public class CustomPathfinder {
         if (isBotMoving && client.options != null) {
             client.options.forwardKey.setPressed(false);
             client.options.backKey.setPressed(false);
+            client.options.leftKey.setPressed(false);
+            client.options.rightKey.setPressed(false);
             client.options.jumpKey.setPressed(false);
             client.options.sneakKey.setPressed(false);
             isBotMoving = false;
@@ -45,71 +47,48 @@ public class CustomPathfinder {
 
         if (currentGoal == null || !currentGoal.equals(targetPos)) {
             startMovingTo(targetPos);
-            currentPath = computeSimpleAStar(client, player.getBlockPos(), targetPos);
         }
 
-        // Neu nhan vat dang dung de len chinh khoi can dat -> Tu dong lui ra ngoai de dat khoi
-        boolean standingInsideBlock = player.getBoundingBox().expand(0.05).intersects(new Box(targetPos));
+        // Thu nho Box 0.08 de khi dung TREN mat khoi hoac sat canh khoi khong bi tinh nham la ket trong khoi
+        Box shrinkBox = new Box(targetPos).contract(0.08);
+        boolean standingInsideBlock = player.getBoundingBox().intersects(shrinkBox);
+
         if (standingInsideBlock) {
             isBotMoving = true;
-            double dx = player.getX() - (targetPos.getX() + 0.5);
-            double dz = player.getZ() - (targetPos.getZ() + 0.5);
-            if (Math.abs(dx) < 0.05 && Math.abs(dz) < 0.05) dx = 1.0;
-            double len = Math.sqrt(dx * dx + dz * dz);
-            double speed = 0.15;
-            player.setVelocity((dx / len) * speed, player.getVelocity().y, (dz / len) * speed);
-            client.options.backKey.setPressed(true);
+            // Tim o trong xung quanh de buoc ra muot ma
+            BlockPos escapePos = findSafeStepOutPos(client, targetPos);
+            moveSmoothlyTowards(client, player, Vec3d.ofCenter(escapePos));
             return false;
-        } else if (isBotMoving) {
-            client.options.backKey.setPressed(false);
         }
 
         double distSq = player.getEyePos().squaredDistanceTo(Vec3d.ofCenter(targetPos));
-        if (distSq <= 16.5) {
+        // Trong tam dat khoi (<= 4.2 blocks) -> Dung di chuyen de dat luon
+        if (distSq <= 17.5) {
             stopMovement(client);
             return true;
         }
 
         isBotMoving = true;
-        BlockPos nextStep = currentPath.isEmpty() ? targetPos : (BlockPos) currentPath.get(0);
-        if (player.getBlockPos().getSquaredDistance(nextStep) <= 1.5 && !currentPath.isEmpty()) {
-            currentPath.remove(0);
-        }
+        moveSmoothlyTowards(client, player, Vec3d.ofCenter(targetPos));
 
-        double dx = (nextStep.getX() + 0.5) - player.getX();
-        double dz = (nextStep.getZ() + 0.5) - player.getZ();
-        float moveYaw = (float) (MathHelper.atan2(dz, dx) * (180.0 / Math.PI)) - 90.0f;
-        AntiSusRotator.stepSmoothRotation(client, moveYaw, 15.0f, 0.85f);
-
-        client.options.forwardKey.setPressed(true);
-
-        // Ho tro di chuyen truc tiep tren Zalith Launcher khi nut cam ung chan forwardKey
-        double horizDist = Math.sqrt(dx * dx + dz * dz);
-        if (horizDist > 0.2 && player.isOnGround()) {
-            double walkSpeed = client.options.sneakKey.isPressed() ? 0.06 : 0.18;
-            Vec3d vel = player.getVelocity();
-            if (vel.x * vel.x + vel.z * vel.z < 0.01) {
-                player.setVelocity((dx / horizDist) * walkSpeed, vel.y, (dz / horizDist) * walkSpeed);
-            }
-        }
-
+        // Tu nhay khi gap vat can 1 block truoc mat
         if (player.horizontalCollision && player.isOnGround()) {
-            player.jump();
             client.options.jumpKey.setPressed(true);
         } else {
             client.options.jumpKey.setPressed(false);
         }
 
-        BlockPos belowNext = player.getBlockPos().down();
-        if (config.autoBridgeEnabled && client.world.getBlockState(belowNext).isAir()) {
+        // Bac cau tam khi di qua ho
+        BlockPos belowPlayer = player.getBlockPos().down();
+        if (config.autoBridgeEnabled && client.world.getBlockState(belowPlayer).isAir()) {
             client.options.sneakKey.setPressed(true);
             int cobbleSlot = findCobblestoneInHotbar(player);
             if (cobbleSlot != -1 && client.interactionManager != null) {
                 BuildBotClient.setSelectedSlot(player, cobbleSlot);
-                BlockHitResult hit = new BlockHitResult(Vec3d.ofCenter(belowNext), Direction.UP, belowNext, false);
+                BlockHitResult hit = new BlockHitResult(Vec3d.ofCenter(belowPlayer), Direction.UP, belowPlayer, false);
                 client.interactionManager.interactBlock(player, Hand.MAIN_HAND, hit);
                 player.swingHand(Hand.MAIN_HAND);
-                placedBridgeBlocks.addLast(belowNext);
+                placedBridgeBlocks.addLast(belowPlayer);
             }
         } else {
             client.options.sneakKey.setPressed(false);
@@ -118,69 +97,42 @@ public class CustomPathfinder {
         return false;
     }
 
+    /**
+     * Phoi hop 4 phim W, A, S, D theo goc nhin hien tai de di chuyen muot ma khong can giat camera
+     */
+    private void moveSmoothlyTowards(MinecraftClient client, ClientPlayerEntity player, Vec3d targetVec) {
+        double dx = targetVec.x - player.getX();
+        double dz = targetVec.z - player.getZ();
+        float targetYaw = (float) (MathHelper.atan2(dz, dx) * (180.0 / Math.PI)) - 90.0f;
+        float diff = MathHelper.wrapDegrees(targetYaw - player.getYaw());
+
+        boolean w = false, s = false, a = false, d = false;
+        if (diff >= -67.5f && diff <= 67.5f) w = true;
+        else if (diff >= 112.5f || diff <= -112.5f) s = true;
+
+        if (diff >= 22.5f && diff <= 157.5f) d = true;
+        else if (diff <= -22.5f && diff >= -157.5f) a = true;
+
+        client.options.forwardKey.setPressed(w);
+        client.options.backKey.setPressed(s);
+        client.options.leftKey.setPressed(a);
+        client.options.rightKey.setPressed(d);
+    }
+
+    private BlockPos findSafeStepOutPos(MinecraftClient client, BlockPos blockedPos) {
+        for (Direction dir : Direction.Type.HORIZONTAL) {
+            BlockPos adj = blockedPos.offset(dir);
+            if (client.world.getBlockState(adj).isAir() && !client.world.getBlockState(adj.down()).isAir()) {
+                return adj;
+            }
+        }
+        return blockedPos.north();
+    }
+
     private int findCobblestoneInHotbar(ClientPlayerEntity player) {
         for (int i = 0; i < 9; i++) {
             if (player.getInventory().getStack(i).isOf(Items.COBBLESTONE)) return i;
         }
         return -1;
-    }
-
-    private List computeSimpleAStar(MinecraftClient client, BlockPos start, BlockPos goal) {
-        PriorityQueue open = new PriorityQueue(Comparator.comparingDouble(n -> ((Node) n).f));
-        Map allNodes = new HashMap();
-        Set closed = new HashSet();
-
-        Node startNode = new Node(start, null, 0, start.getSquaredDistance(goal));
-        open.add(startNode);
-        allNodes.put(start, startNode);
-
-        int iterations = 0;
-        while (!open.isEmpty() && iterations++ < 250) {
-            Node current = (Node) open.poll();
-            if (current.pos.getSquaredDistance(goal) <= 9.0) {
-                List path = new ArrayList();
-                Node curr = current;
-                while (curr != null) {
-                    path.add(0, curr.pos);
-                    curr = curr.parent;
-                }
-                return path;
-            }
-            closed.add(current.pos);
-
-            for (Direction dir : Direction.Type.HORIZONTAL) {
-                BlockPos neighbor = current.pos.offset(dir);
-                if (closed.contains(neighbor)) continue;
-
-                if (!client.world.getBlockState(neighbor).isAir()) {
-                    neighbor = neighbor.up();
-                    if (!client.world.getBlockState(neighbor).isAir()) continue;
-                }
-
-                double gScore = current.g + 1.0;
-                Node nextNode = (Node) allNodes.getOrDefault(neighbor, new Node(neighbor, current, Double.MAX_VALUE, 0));
-                if (gScore < nextNode.g) {
-                    nextNode.parent = current;
-                    nextNode.g = gScore;
-                    nextNode.f = gScore + Math.sqrt(neighbor.getSquaredDistance(goal));
-                    allNodes.put(neighbor, nextNode);
-                    open.add(nextNode);
-                }
-            }
-        }
-        return new ArrayList(Collections.singletonList(goal));
-    }
-
-    private static class Node {
-        BlockPos pos;
-        Node parent;
-        double g, f;
-
-        Node(BlockPos pos, Node parent, double g, double f) {
-            this.pos = pos;
-            this.parent = parent;
-            this.g = g;
-            this.f = f;
-        }
     }
 }
