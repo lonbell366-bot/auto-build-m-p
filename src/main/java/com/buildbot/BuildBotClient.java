@@ -37,7 +37,7 @@ public class BuildBotClient implements ClientModInitializer {
     private final CustomPathfinder pathfinder = new CustomPathfinder();
     private final OrderAndSellManager orderSell = new OrderAndSellManager();
     private int retryRound = 0, delayTimer = 0, slotSyncCooldown = 0, easyPlaceCooldown = 0;
-    private boolean openGui = false, wasF10 = false, isBotEating = false;
+    private boolean openGui = false, wasF10 = false, isBotEating = false, isPlacing = false;
 
     @Override
     public void onInitializeClient() {
@@ -57,21 +57,26 @@ public class BuildBotClient implements ClientModInitializer {
             }
         });
 
-        // EASY PLACE CHONG GHOST BLOCK: Doi 1 tick sau khi doi slot va bam vao khoi diem tua that
+        // Da bo world.isClient (field_9236) va them khoa isPlacing de khong bao gio crash tren 1.21.11
         UseBlockCallback.EVENT.register((player, world, hand, hit) -> {
-            if (!world.isClient || !config.easyPlaceEnabled || hand != Hand.MAIN_HAND || easyPlaceCooldown > 0) {
+            if (isPlacing || !config.easyPlaceEnabled || hand != Hand.MAIN_HAND || easyPlaceCooldown > 0) {
                 return ActionResult.PASS;
             }
+            MinecraftClient client = MinecraftClient.getInstance();
+            if (client.world == null || client.player == null) return ActionResult.PASS;
+
             BlockPos pos = hit.getBlockPos().offset(hit.getSide());
             BlockState st = getExpectedState(pos);
-            if (st != null && !st.isAir() && world.getBlockState(pos).isAir()) {
-                MinecraftClient client = MinecraftClient.getInstance();
+            if (st != null && !st.isAir() && client.world.getBlockState(pos).isAir()) {
                 if (equipItem(client, st) && slotSyncCooldown == 0) {
                     float[] rot = AntiSusRotator.getRequiredRotationForState(pos, st, client.player);
                     AntiSusRotator.stepSmoothRotation(client, rot[0], rot[1], 0.75f);
-                    if (AntiSusRotator.placeBlockSmart(client, pos, st, Hand.MAIN_HAND)) {
+                    isPlacing = true;
+                    boolean ok = AntiSusRotator.placeBlockSmart(client, pos, st, Hand.MAIN_HAND);
+                    isPlacing = false;
+                    if (ok) {
                         easyPlaceCooldown = 4;
-                        return ActionResult.FAIL; // Chan client tu dat khoi ao trung lap
+                        return ActionResult.FAIL;
                     }
                 }
                 return ActionResult.FAIL;
@@ -166,7 +171,9 @@ public class BuildBotClient implements ClientModInitializer {
             if (act.isOf(exp.getBlock()) && ((act.getBlock() instanceof RepeaterBlock && !Objects.equals(act.get(Properties.DELAY), exp.get(Properties.DELAY)))
                     || (act.getBlock() instanceof ComparatorBlock && act.get(Properties.COMPARATOR_MODE) != exp.get(Properties.COMPARATOR_MODE)))) {
                 botStatusText = "Dang chinh Repeater/Comparator";
+                isPlacing = true;
                 client.interactionManager.interactBlock(player, Hand.MAIN_HAND, new BlockHitResult(Vec3d.ofCenter(pos), Direction.UP, pos, false));
+                isPlacing = false;
                 resetDelay(); return;
             }
             if (config.autoMineEnabled && client.interactionManager != null) {
@@ -183,7 +190,6 @@ public class BuildBotClient implements ClientModInitializer {
             return;
         }
 
-        // CHONG GHOST BLOCK: Cho 1 tick sau khi doi slot de Server cap nhat vat pham tren tay
         if (slotSyncCooldown > 0) return;
 
         float[] rot = AntiSusRotator.getRequiredRotationForState(pos, exp, player);
@@ -193,12 +199,14 @@ public class BuildBotClient implements ClientModInitializer {
         }
 
         botStatusText = "Dang dat: " + exp.getBlock().getName().getString();
-        if (AntiSusRotator.placeBlockSmart(client, pos, exp, Hand.MAIN_HAND)) {
-            if (exp.contains(Properties.WATERLOGGED) && exp.get(Properties.WATERLOGGED) && equipRawItem(client, Items.WATER_BUCKET)) {
-                client.interactionManager.interactBlock(player, Hand.MAIN_HAND, new BlockHitResult(Vec3d.ofCenter(pos), Direction.UP, pos, false));
-            }
-            resetDelay();
+        isPlacing = true;
+        boolean placed = AntiSusRotator.placeBlockSmart(client, pos, exp, Hand.MAIN_HAND);
+        if (placed && exp.contains(Properties.WATERLOGGED) && exp.get(Properties.WATERLOGGED) && equipRawItem(client, Items.WATER_BUCKET)) {
+            client.interactionManager.interactBlock(player, Hand.MAIN_HAND, new BlockHitResult(Vec3d.ofCenter(pos), Direction.UP, pos, false));
         }
+        isPlacing = false;
+
+        if (placed) resetDelay();
     }
 
     public static int getSelectedSlot(PlayerEntity p) {
@@ -243,7 +251,7 @@ public class BuildBotClient implements ClientModInitializer {
             if (p.getInventory().getStack(i).isOf(item)) {
                 setSelectedSlot(p, i);
                 p.networkHandler.sendPacket(new UpdateSelectedSlotC2SPacket(i));
-                slotSyncCooldown = 2; // Doi 2 ticks de dong bo voi DonutSMP
+                slotSyncCooldown = 2;
                 return true;
             }
         }
@@ -251,7 +259,7 @@ public class BuildBotClient implements ClientModInitializer {
             if (p.getInventory().getStack(i).isOf(item) && c.interactionManager != null) {
                 c.interactionManager.clickSlot(p.playerScreenHandler.syncId, i, cur, SlotActionType.SWAP, p);
                 p.networkHandler.sendPacket(new UpdateSelectedSlotC2SPacket(cur));
-                slotSyncCooldown = 3; // Doi 3 ticks sau khi Swap tu Balo
+                slotSyncCooldown = 3;
                 return true;
             }
         }
@@ -320,5 +328,4 @@ public class BuildBotClient implements ClientModInitializer {
     private void resetDelay() {
         delayTimer = ThreadLocalRandom.current().nextInt(config.minPlaceDelayTicks, config.maxPlaceDelayTicks + 1);
     }
-    }
-            
+}
