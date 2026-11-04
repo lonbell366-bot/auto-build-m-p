@@ -5,10 +5,7 @@ import net.minecraft.client.network.ClientPlayerEntity;
 import net.minecraft.item.Items;
 import net.minecraft.util.Hand;
 import net.minecraft.util.hit.BlockHitResult;
-import net.minecraft.util.math.BlockPos;
-import net.minecraft.util.math.Direction;
-import net.minecraft.util.math.MathHelper;
-import net.minecraft.util.math.Vec3d;
+import net.minecraft.util.math.*;
 
 import java.util.*;
 
@@ -18,7 +15,7 @@ public class CustomPathfinder {
     private final Deque placedBridgeBlocks = new ArrayDeque();
     private long moveStartTime = 0;
     private BlockPos currentGoal = null;
-    private boolean isBotMoving = false; // Chi nha phim 1 lan khi bot dung
+    private boolean isBotMoving = false;
 
     public void startMovingTo(BlockPos target) {
         this.currentGoal = target;
@@ -32,6 +29,7 @@ public class CustomPathfinder {
     public void stopMovement(MinecraftClient client) {
         if (isBotMoving && client.options != null) {
             client.options.forwardKey.setPressed(false);
+            client.options.backKey.setPressed(false);
             client.options.jumpKey.setPressed(false);
             client.options.sneakKey.setPressed(false);
             isBotMoving = false;
@@ -50,21 +48,25 @@ public class CustomPathfinder {
             currentPath = computeSimpleAStar(client, player.getBlockPos(), targetPos);
         }
 
-        double distSq = player.squaredDistanceTo(Vec3d.ofCenter(targetPos));
-        if (distSq <= 16.0) {
+        // Neu nhan vat dang dung de len chinh khoi can dat -> Tu dong lui ra ngoai de dat khoi
+        boolean standingInsideBlock = player.getBoundingBox().expand(0.05).intersects(new Box(targetPos));
+        if (standingInsideBlock) {
+            isBotMoving = true;
+            double dx = player.getX() - (targetPos.getX() + 0.5);
+            double dz = player.getZ() - (targetPos.getZ() + 0.5);
+            if (Math.abs(dx) < 0.05 && Math.abs(dz) < 0.05) dx = 1.0;
+            double len = Math.sqrt(dx * dx + dz * dz);
+            double speed = 0.15;
+            player.setVelocity((dx / len) * speed, player.getVelocity().y, (dz / len) * speed);
+            client.options.backKey.setPressed(true);
+            return false;
+        } else if (isBotMoving) {
+            client.options.backKey.setPressed(false);
+        }
+
+        double distSq = player.getEyePos().squaredDistanceTo(Vec3d.ofCenter(targetPos));
+        if (distSq <= 16.5) {
             stopMovement(client);
-            if (config.reclaimBridgeEnabled && !placedBridgeBlocks.isEmpty()) {
-                BlockPos lastBridge = (BlockPos) placedBridgeBlocks.peekLast();
-                if (lastBridge != null && !lastBridge.equals(player.getBlockPos().down()) && player.squaredDistanceTo(Vec3d.ofCenter(lastBridge)) <= 16.0) {
-                    if (client.interactionManager != null) {
-                        client.interactionManager.updateBlockBreakingProgress(lastBridge, Direction.UP);
-                        player.swingHand(Hand.MAIN_HAND);
-                        if (client.world.getBlockState(lastBridge).isAir()) {
-                            placedBridgeBlocks.pollLast();
-                        }
-                    }
-                }
-            }
             return true;
         }
 
@@ -77,11 +79,22 @@ public class CustomPathfinder {
         double dx = (nextStep.getX() + 0.5) - player.getX();
         double dz = (nextStep.getZ() + 0.5) - player.getZ();
         float moveYaw = (float) (MathHelper.atan2(dz, dx) * (180.0 / Math.PI)) - 90.0f;
-        AntiSusRotator.stepSmoothRotation(client, moveYaw, player.getPitch(), config.smoothRotationSpeed);
+        AntiSusRotator.stepSmoothRotation(client, moveYaw, 15.0f, 0.85f);
 
         client.options.forwardKey.setPressed(true);
 
+        // Ho tro di chuyen truc tiep tren Zalith Launcher khi nut cam ung chan forwardKey
+        double horizDist = Math.sqrt(dx * dx + dz * dz);
+        if (horizDist > 0.2 && player.isOnGround()) {
+            double walkSpeed = client.options.sneakKey.isPressed() ? 0.06 : 0.18;
+            Vec3d vel = player.getVelocity();
+            if (vel.x * vel.x + vel.z * vel.z < 0.01) {
+                player.setVelocity((dx / horizDist) * walkSpeed, vel.y, (dz / horizDist) * walkSpeed);
+            }
+        }
+
         if (player.horizontalCollision && player.isOnGround()) {
+            player.jump();
             client.options.jumpKey.setPressed(true);
         } else {
             client.options.jumpKey.setPressed(false);
