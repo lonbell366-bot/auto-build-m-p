@@ -12,6 +12,17 @@ import java.util.*;
 @SuppressWarnings({"unchecked", "rawtypes"})
 public class CustomPathfinder {
     private boolean isBotMoving = false;
+    private long moveStartTime = 0;
+    private BlockPos currentGoal = null;
+
+    public void startMovingTo(BlockPos target) {
+        this.currentGoal = target;
+        this.moveStartTime = System.currentTimeMillis();
+    }
+
+    public boolean isTimedOut(int timeoutSeconds) {
+        return moveStartTime > 0 && (System.currentTimeMillis() - moveStartTime) > timeoutSeconds * 1000L;
+    }
 
     public void stopMovement(MinecraftClient client) {
         if (isBotMoving && client.options != null) {
@@ -23,11 +34,17 @@ public class CustomPathfinder {
             client.options.sneakKey.setPressed(false);
             isBotMoving = false;
         }
+        currentGoal = null;
+        moveStartTime = 0;
     }
 
     public boolean tickMoveToTarget(MinecraftClient client, BlockPos targetPos, BuildBotConfig config) {
         ClientPlayerEntity player = client.player;
         if (player == null || client.world == null) return false;
+
+        if (currentGoal == null || !currentGoal.equals(targetPos)) {
+            startMovingTo(targetPos);
+        }
 
         Box shrinkBox = new Box(targetPos).contract(0.1);
         if (player.getBoundingBox().intersects(shrinkBox)) {
