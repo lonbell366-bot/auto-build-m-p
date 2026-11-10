@@ -35,10 +35,8 @@ public class BuildBotClient implements ClientModInitializer {
     private final CustomPathfinder pathfinder = new CustomPathfinder();
     private final OrderAndSellManager orderSell = new OrderAndSellManager();
     private BlockPos preparedPos = null;
-    
-    // Khai bao du bien retryRound de khong bi loi thieu symbol
     private int retryRound = 0, delayTimer = 0, slotSyncCooldown = 0, easyPlaceCooldown = 0;
-    private boolean openGui = false, wasF10 = false, isBotEating = false, isInternalPlace = false;
+    private boolean openGui = false, wasF10 = false, isBotEating = false;
 
     @Override
     public void onInitializeClient() {
@@ -66,6 +64,7 @@ public class BuildBotClient implements ClientModInitializer {
 
         if (slotSyncCooldown > 0) slotSyncCooldown--;
         if (easyPlaceCooldown > 0) easyPlaceCooldown--;
+        if (delayTimer > 0) delayTimer--;
 
         try {
             long win = GLFW.glfwGetCurrentContext();
@@ -83,8 +82,9 @@ public class BuildBotClient implements ClientModInitializer {
 
         orderSell.checkAndStartAutoSell(client, config);
 
+        // EASY PLACE SIEU NHANH: Bam hoac giu chuot phai la dat khop ngay lap tuc
         if (config.easyPlaceEnabled && client.options.useKey.isPressed() && easyPlaceCooldown == 0) {
-            if (tryEasyPlace(client, player)) return;
+            if (tryFastEasyPlace(client, player)) return;
         }
 
         if (config.autoBuildEnabled && schematic == null) {
@@ -95,33 +95,46 @@ public class BuildBotClient implements ClientModInitializer {
             pathfinder.stopMovement(client);
             return;
         }
-        if (delayTimer > 0) { delayTimer--; return; }
 
+        // Luon chay runBuildTick moi tick de nhan vat di chuyen muot ma khong bi ngat quang
         runBuildTick(client, player);
     }
 
-    private boolean tryEasyPlace(MinecraftClient client, ClientPlayerEntity player) {
+    private boolean tryFastEasyPlace(MinecraftClient client, ClientPlayerEntity player) {
         Vec3d eye = player.getEyePos();
         Vec3d look = player.getRotationVec(1.0F);
-        for (double d = 1.0; d <= 4.4; d += 0.3) {
+
+        for (double d = 0.8; d <= 4.5; d += 0.25) {
             BlockPos pos = BlockPos.ofFloored(eye.add(look.multiply(d)));
             if (!client.world.getBlockState(pos).isAir()) continue;
-            BlockState exp = getExpectedState(pos);
-            if (exp == null || exp.isAir() || AntiSusRotator.findValidPlaceHit(client, pos, exp) == null) continue;
-            if (!equipItem(client, exp)) continue;
 
-            float[] rot = AntiSusRotator.getRequiredRotationForState(pos, exp, player);
-            player.setYaw(rot[0]); player.setPitch(rot[1]);
+            BlockState exp = getExpectedState(pos);
+            if (exp == null || exp.isAir()) continue;
+            if (AntiSusRotator.findValidPlaceHit(client, pos, exp) == null) continue;
+            if (!equipItem(client, exp)) continue;
 
             boolean needSneak = AntiSusRotator.requiresSneakToPlace(client, pos, exp);
             if (needSneak) client.options.sneakKey.setPressed(true);
 
-            isInternalPlace = true;
-            boolean ok = AntiSusRotator.placeBlockSmart(client, pos, exp, Hand.MAIN_HAND);
-            isInternalPlace = false;
+            // Neu la Observer/Piston/Repeater: Xoay 1 tick roi dat ngay o tick ke tiep de 100% khop huong Server
+            if (AntiSusRotator.needsStrictLookRotation(exp)) {
+                float[] rot = AntiSusRotator.getRequiredRotationForState(pos, exp, player);
+                AntiSusRotator.stepSmoothRotation(client, rot[0], rot[1], 1.0f);
+                if (!pos.equals(preparedPos) || slotSyncCooldown > 0) {
+                    preparedPos = pos;
+                    return true;
+                }
+            } else if (slotSyncCooldown > 0) {
+                return true;
+            }
 
+            if (AntiSusRotator.placeBlockSmart(client, pos, exp, Hand.MAIN_HAND)) {
+                preparedPos = null;
+                easyPlaceCooldown = 2;
+                if (needSneak) client.options.sneakKey.setPressed(false);
+                return true;
+            }
             if (needSneak) client.options.sneakKey.setPressed(false);
-            if (ok) { easyPlaceCooldown = 2; return true; }
         }
         return false;
     }
@@ -129,62 +142,118 @@ public class BuildBotClient implements ClientModInitializer {
     private void runBuildTick(MinecraftClient client, ClientPlayerEntity player) {
         if (currentLayerY >= schematic.height) {
             config.autoBuildEnabled = false; config.save(); pathfinder.stopMovement(client);
-            player.sendMessage(Text.literal("§a[BuildBot] Hoan thanh cong trinh!"), false);
+            botStatusText = "Hoan thanh 100%!";
+            player.sendMessage(Text.literal("§a[BuildBot] Da hoan thanh cong trinh!"), false);
             return;
         }
 
         long now = System.currentTimeMillis();
-        List missing = new ArrayList();
-        List ready = new ArrayList();
+        List haveItemMissing = new ArrayList();
+        List haveItemReady = new ArrayList();
+        Item missingOrderItem = null;
 
         for (int dy = 0; dy < config.layerHeight && (currentLayerY + dy) < schematic.height; dy++) {
             int y = currentLayerY + dy;
             for (int x = 0; x < schematic.width; x++) {
                 for (int z = 0; z < schematic.length; z++) {
                     BlockPos wp = new BlockPos(config.originX + x, config.originY + y, config.originZ + z);
-                    Long last = (Long) AntiSusRotator.recentlyPlaced.get(wp);
-                    if (last != null && (now - last) < 250L) continue;
-
                     BlockState exp = getExpectedState(wp);
+                    // QUAN TRONG: Bo qua tat ca cac o khong khi (Air) de khong bao gio bi ket!
+                    if (exp == null || exp.isAir()) continue;
+
+                    Long last = (Long) AntiSusRotator.recentlyPlaced.get(wp);
+                    if (last != null && (now - last) < 200L) continue;
+
                     if (!isMatching(client.world.getBlockState(wp), exp)) {
-                        missing.add(wp);
-                        if (exp.isAir() || AntiSusRotator.findValidPlaceHit(client, wp, exp) != null) ready.add(wp);
+                        if (hasItemInInventory(player, getItem(exp))) {
+                            haveItemMissing.add(wp);
+                            if (AntiSusRotator.findValidPlaceHit(client, wp, exp) != null) {
+                                haveItemReady.add(wp);
+                            }
+                        } else if (missingOrderItem == null) {
+                            missingOrderItem = getItem(exp);
+                        }
                     }
                 }
             }
         }
 
-        if (missing.isEmpty()) {
-            currentLayerY += config.layerHeight; retryRound = 0; preparedPos = null;
-            player.sendMessage(Text.literal("§b[BuildBot] Len tang Y = " + currentLayerY), true);
+        // Neu tang hien tai da dat het cac khoi ma ban co trong tui -> Tu dong len tang Y tiep theo!
+        if (haveItemMissing.isEmpty()) {
+            if (missingOrderItem != null && config.autoOrderEnabled) {
+                orderSell.startOrderFetch(client, missingOrderItem, 32);
+                return;
+            }
+            currentLayerY += config.layerHeight;
+            retryRound = 0;
+            preparedPos = null;
+            botStatusText = "Len tang Y = " + currentLayerY;
+            player.sendMessage(Text.literal("§b[BuildBot] Xong tang! Nhay len tang Y = " + currentLayerY), true);
+            // Nhay len ngay khi chuyen tang
+            if (player.isOnGround()) player.jump();
             return;
         }
 
-        ready.sort(Comparator.comparingInt(p -> SchematicData.getDependencyOrder(getExpectedState((BlockPos) p)))
-                .thenComparingDouble(p -> player.squaredDistanceTo(Vec3d.ofCenter((BlockPos) p))));
+        List pool = haveItemReady.isEmpty() ? haveItemMissing : haveItemReady;
 
-        BlockPos pos = (BlockPos) (ready.isEmpty() ? missing.get(0) : ready.get(0));
+        // Sap xep thong minh: Xay cac khoi xung quanh truoc, chua khoi ngay duoi chan (player.getBlockPos()) lai cuoi cung de nhay len dat!
+        BlockPos playerFoot = player.getBlockPos();
+        pool.sort(Comparator.comparingInt(p -> SchematicData.getDependencyOrder(getExpectedState((BlockPos) p)))
+                .thenComparingDouble(p -> {
+                    BlockPos bp = (BlockPos) p;
+                    double d = player.squaredDistanceTo(Vec3d.ofCenter(bp));
+                    return (bp.getX() == playerFoot.getX() && bp.getZ() == playerFoot.getZ()) ? d + 100.0 : d;
+                }));
+
+        BlockPos pos = (BlockPos) pool.get(0);
         BlockState exp = getExpectedState(pos);
+        BlockState act = client.world.getBlockState(pos);
 
+        // Neu o do bi dat sai khoi -> Tu dao khoi sai
+        if (!act.isAir() && !act.getFluidState().isStill()) {
+            if (config.autoMineEnabled && client.interactionManager != null) {
+                botStatusText = "Dao khoi sai: " + pos.toShortString();
+                client.interactionManager.updateBlockBreakingProgress(pos, Direction.UP);
+                player.swingHand(Hand.MAIN_HAND);
+            }
+            return;
+        }
+
+        // Di chuyen muot ma (Hoac tu nhay len neu khoi nam ngay duoi chan)
         if (!pathfinder.tickMoveToTarget(client, pos, config)) {
-            preparedPos = null;
+            botStatusText = "Di chuyen -> " + pos.toShortString();
             if (pathfinder.isTimedOut(config.moveTimeoutSeconds)) retryRound++;
             return;
         }
-        if (delayTimer > 0) { delayTimer--; return; }
-        if (exp.isAir() || !equipItem(client, exp)) return;
+
+        if (delayTimer > 0 || !equipItem(client, exp)) return;
 
         boolean needSneak = AntiSusRotator.requiresSneakToPlace(client, pos, exp);
-        if (needSneak) client.options.sneakKey.setPressed(true);
-        else client.options.sneakKey.setPressed(false);
+        client.options.sneakKey.setPressed(needSneak);
 
         float[] rot = AntiSusRotator.getRequiredRotationForState(pos, exp, player);
-        if (!AntiSusRotator.stepSmoothRotation(client, rot[0], rot[1], 0.9f) || slotSyncCooldown > 0 || !pos.equals(preparedPos)) {
-            preparedPos = pos; return;
+        boolean rotDone = AntiSusRotator.stepSmoothRotation(client, rot[0], rot[1], 1.0f);
+
+        // Neu la Observer/Piston/Repeater hoac vua doi slot: Cho 1 tick dong bo voi Server roi dat ngay
+        if (slotSyncCooldown > 0 || (AntiSusRotator.needsStrictLookRotation(exp) && (!rotDone || !pos.equals(preparedPos)))) {
+            preparedPos = pos;
+            return;
         }
 
-        if (AntiSusRotator.placeBlockSmart(client, pos, exp, Hand.MAIN_HAND)) resetDelay();
+        botStatusText = "Dat: " + exp.getBlock().getName().getString();
+        if (AntiSusRotator.placeBlockSmart(client, pos, exp, Hand.MAIN_HAND)) {
+            resetDelay();
+        }
+        if (needSneak) client.options.sneakKey.setPressed(false);
         preparedPos = null;
+    }
+
+    private boolean hasItemInInventory(ClientPlayerEntity p, Item item) {
+        if (item == Items.AIR) return false;
+        for (int i = 0; i < 36; i++) {
+            if (p.getInventory().getStack(i).isOf(item)) return true;
+        }
+        return false;
     }
 
     public static int getSelectedSlot(PlayerEntity p) {
@@ -214,6 +283,7 @@ public class BuildBotClient implements ClientModInitializer {
     private Item getItem(BlockState s) {
         if (s.isOf(Blocks.WATER)) return Items.WATER_BUCKET;
         if (s.isOf(Blocks.LAVA)) return Items.LAVA_BUCKET;
+        if (s.isOf(Blocks.REDSTONE_WIRE)) return Items.REDSTONE;
         return s.getBlock().asItem();
     }
 
@@ -269,7 +339,6 @@ public class BuildBotClient implements ClientModInitializer {
 
     public void loadSchematicAtPlayer(MinecraftClient c) { syncFromLitematica(c); }
 
-    // Ham printMaterialList duoc goi tu BuildBotScreen
     public void printMaterialList(MinecraftClient c) {
         if (c == null || c.player == null || schematic == null) return;
         c.player.sendMessage(Text.literal("§6=== Vat Lieu ==="), false);
@@ -290,11 +359,14 @@ public class BuildBotClient implements ClientModInitializer {
     }
 
     private boolean isMatching(BlockState a, BlockState e) {
-        if (e == null || e.isAir()) return a.isAir();
-        return a.isOf(e.getBlock());
+        if (e == null || e.isAir()) return true;
+        if (!a.isOf(e.getBlock())) return false;
+        if (e.contains(Properties.FACING) && a.get(Properties.FACING) != e.get(Properties.FACING)) return false;
+        if (e.contains(Properties.HORIZONTAL_FACING) && a.get(Properties.HORIZONTAL_FACING) != e.get(Properties.HORIZONTAL_FACING)) return false;
+        return true;
     }
 
     private void resetDelay() {
-        delayTimer = ThreadLocalRandom.current().nextInt(Math.max(1, config.minPlaceDelayTicks), Math.max(2, config.maxPlaceDelayTicks) + 1);
+        delayTimer = ThreadLocalRandom.current().nextInt(1, Math.max(2, config.minPlaceDelayTicks) + 1);
     }
-}
+    }
