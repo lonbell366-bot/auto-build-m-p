@@ -20,6 +20,9 @@ public class AntiSusRotator {
 
     public static final Map recentlyPlaced = new ConcurrentHashMap();
 
+    /**
+     * Xoay sieu toc (Snap 160 do/tick) co lam tron GCD de dat khoi ngay lap tuc ma khong bi GrimAC bat
+     */
     public static boolean stepSmoothRotation(MinecraftClient client, float targetY, float targetP, float speed) {
         ClientPlayerEntity player = client.player;
         if (player == null) return true;
@@ -29,14 +32,14 @@ public class AntiSusRotator {
         float diffYaw = MathHelper.wrapDegrees(targetY - currentYaw);
         float diffPitch = targetP - currentPitch;
 
-        if (Math.abs(diffYaw) < 3.0f && Math.abs(diffPitch) < 3.0f) {
+        if (Math.abs(diffYaw) < 4.5f && Math.abs(diffPitch) < 4.5f) {
             return true;
         }
 
-        float maxStep = 110.0f;
-        float jitter = (ThreadLocalRandom.current().nextFloat() - 0.5f) * 0.25f;
-        float stepYaw = MathHelper.clamp(diffYaw * 0.85f, -maxStep, maxStep) + jitter;
-        float stepPitch = MathHelper.clamp(diffPitch * 0.85f, -maxStep, maxStep) + jitter;
+        float maxStep = 160.0f;
+        float jitter = (ThreadLocalRandom.current().nextFloat() - 0.5f) * 0.15f;
+        float stepYaw = MathHelper.clamp(diffYaw * 0.95f, -maxStep, maxStep) + jitter;
+        float stepPitch = MathHelper.clamp(diffPitch * 0.95f, -maxStep, maxStep) + jitter;
 
         float gcd = getMouseGCD(client);
         if (gcd > 0.0001f) {
@@ -46,8 +49,8 @@ public class AntiSusRotator {
 
         player.setYaw(currentYaw + stepYaw);
         player.setPitch(MathHelper.clamp(currentPitch + stepPitch, -90.0f, 90.0f));
-        return Math.abs(MathHelper.wrapDegrees(targetY - player.getYaw())) < 3.5f
-                && Math.abs(targetP - player.getPitch()) < 3.5f;
+        return Math.abs(MathHelper.wrapDegrees(targetY - player.getYaw())) < 5.0f
+                && Math.abs(targetP - player.getPitch()) < 5.0f;
     }
 
     private static float getMouseGCD(MinecraftClient client) {
@@ -56,21 +59,31 @@ public class AntiSusRotator {
         return (float) (f * f * f * 1.2);
     }
 
+    /**
+     * Chi nhung khoi nhu Observer, Piston, Repeater, Comparator, Cau thang moi can xoay dau theo huong.
+     * Khoi Cobblestone, Hopper, Slab... KHONG can xoay dau!
+     */
+    public static boolean needsStrictLookRotation(BlockState state) {
+        Block b = state.getBlock();
+        if (b instanceof HopperBlock) return false;
+        return state.contains(Properties.FACING) || state.contains(Properties.HORIZONTAL_FACING);
+    }
+
     public static BlockHitResult findValidPlaceHit(MinecraftClient client, BlockPos targetPos, BlockState targetState) {
         if (client.world == null || client.player == null) return null;
         Vec3d eye = client.player.getEyePos();
         Block block = targetState.getBlock();
 
-        // 1. Hopper: Bam truc tiep vao khoi nam o huong voi Hopper tro toi
+        // 1. Hopper: Neu khoi o huong voi Hopper da co san thi bam vao do
         if (block instanceof HopperBlock && targetState.contains(Properties.HOPPER_FACING)) {
             Direction outDir = targetState.get(Properties.HOPPER_FACING);
             BlockPos support = targetPos.offset(outDir);
-            if (isSolidSupport(client, support)) {
+            if (isSolidSupport(client, support) && eye.squaredDistanceTo(Vec3d.ofCenter(support)) <= 22.0) {
                 return buildHitResult(support, outDir.getOpposite(), targetState);
             }
         }
 
-        // 2. Quet 6 huong xung quanh de tim diem tua (Cho phep dat ca tren cung mat phang va duoi chan)
+        // 2. Quet 6 mat xung quanh tim khoi ran lam diem tua
         Direction[] order = new Direction[]{Direction.DOWN, Direction.NORTH, Direction.SOUTH, Direction.EAST, Direction.WEST, Direction.UP};
         BlockPos bestSupport = null;
         Direction bestFace = Direction.UP;
@@ -83,10 +96,9 @@ public class AntiSusRotator {
             Direction clickFace = dir.getOpposite();
             Vec3d faceCenter = Vec3d.ofCenter(neighbor).add(Vec3d.of(clickFace.getVector()).multiply(0.5));
             double d = eye.squaredDistanceTo(faceCenter);
-            if (d > 21.0) continue; // Tam voi 4.5 blocks
+            if (d > 22.5) continue; // Tam voi 4.7 blocks
 
-            // Uu tien dat len mat dat (DOWN) hoac khoi khong mo GUI
-            if (dir == Direction.DOWN) d -= 4.0;
+            if (dir == Direction.DOWN) d -= 5.0;
             if (!isInteractiveBlock(client.world.getBlockState(neighbor).getBlock())) d -= 6.0;
 
             if (d < bestScore) {
@@ -132,16 +144,11 @@ public class AntiSusRotator {
         return isInteractiveBlock(supportBlock) || (targetState.getBlock() instanceof HopperBlock);
     }
 
-    /**
-     * Tinh goc xoay chuan 100% cho Observer, Piston, Repeater, Comparator
-     */
     public static float[] getRequiredRotationForState(BlockPos pos, BlockState targetState, ClientPlayerEntity player) {
         Block block = targetState.getBlock();
 
         if (targetState.contains(Properties.FACING) && !(block instanceof HopperBlock)) {
             Direction facing = targetState.get(Properties.FACING);
-            // Observer: Mat do (output) quay ve phia nguoi choi -> Nguoi choi phai nhin cung huong voi FACING
-            // Piston / Dispenser / Dropper: Mat day quay nguoc huong nhin -> Nguoi choi nhin getOpposite()
             Direction lookDir = (block instanceof ObserverBlock) ? facing : facing.getOpposite();
             return directionToAngles(lookDir);
         }
@@ -173,7 +180,7 @@ public class AntiSusRotator {
         if (player == null || client.interactionManager == null || client.world == null) return false;
 
         if (!targetState.getCollisionShape(client.world, targetPos).isEmpty()
-                && player.getBoundingBox().intersects(new Box(targetPos).contract(0.08))) {
+                && player.getBoundingBox().intersects(new Box(targetPos).contract(0.05))) {
             return false;
         }
 
