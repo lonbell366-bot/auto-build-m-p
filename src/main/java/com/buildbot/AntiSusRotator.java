@@ -13,18 +13,25 @@ import net.minecraft.util.math.*;
 
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ThreadLocalRandom;
 
 @SuppressWarnings({"unchecked", "rawtypes"})
 public class AntiSusRotator {
 
     public static final Map recentlyPlaced = new ConcurrentHashMap();
 
+    /**
+     * Xoay goc nhin co nhieu ngau nhien (Human Micro-Jitter) + lam tron luoi do nhay chuot GCD
+     */
     public static boolean stepSmoothRotation(MinecraftClient client, float targetY, float targetP, float speed) {
         ClientPlayerEntity player = client.player;
         if (player == null) return true;
 
-        float diffYaw = MathHelper.wrapDegrees(targetY - player.getYaw());
-        float diffPitch = targetP - player.getPitch();
+        float jitterY = (ThreadLocalRandom.current().nextFloat() - 0.5f) * 0.45f;
+        float jitterP = (ThreadLocalRandom.current().nextFloat() - 0.5f) * 0.35f;
+
+        float diffYaw = MathHelper.wrapDegrees((targetY + jitterY) - player.getYaw());
+        float diffPitch = (targetP + jitterP) - player.getPitch();
 
         float gcd = getMouseGCD(client);
         if (gcd > 0.0001f) {
@@ -54,16 +61,14 @@ public class AntiSusRotator {
         Vec3d eye = client.player.getEyePos();
         Block block = targetState.getBlock();
 
-        // 1. Hopper: Bam truc tiep vao mat khoi ma day Hopper tro vao
         if (block instanceof HopperBlock && targetState.contains(Properties.HOPPER_FACING)) {
             Direction outDir = targetState.get(Properties.HOPPER_FACING);
             BlockPos support = targetPos.offset(outDir);
-            if (isSolidSupport(client, support) && eye.squaredDistanceTo(Vec3d.ofCenter(support)) <= 25.0) {
+            if (isSolidSupport(client, support) && eye.squaredDistanceTo(Vec3d.ofCenter(support)) <= 24.0) {
                 return buildHitResult(support, outDir.getOpposite(), targetState);
             }
         }
 
-        // 2. Quet 6 huong xung quanh tim khoi ran lam diem tua
         Direction[] order = new Direction[]{Direction.DOWN, Direction.NORTH, Direction.SOUTH, Direction.EAST, Direction.WEST, Direction.UP};
         BlockPos bestSupport = null;
         Direction bestFace = Direction.UP;
@@ -76,7 +81,7 @@ public class AntiSusRotator {
             Direction clickFace = dir.getOpposite();
             Vec3d faceCenter = Vec3d.ofCenter(neighbor).add(Vec3d.of(clickFace.getVector()).multiply(0.5));
             double d = eye.squaredDistanceTo(faceCenter);
-            if (d > 25.0) continue;
+            if (d > 24.0) continue;
 
             if (dir == Direction.DOWN) d -= 5.0;
             if (!isInteractiveBlock(client.world.getBlockState(neighbor).getBlock())) d -= 6.0;
@@ -91,14 +96,21 @@ public class AntiSusRotator {
         return bestSupport != null ? buildHitResult(bestSupport, bestFace, targetState) : null;
     }
 
+    /**
+     * Tao diem bam co do lech ngau nhien (Random HitVec Offset) de GrimAC khong phat hien bam cung 1 diem
+     */
     private static BlockHitResult buildHitResult(BlockPos supportPos, Direction clickFace, BlockState targetState) {
-        double yOff = 0.5;
+        ThreadLocalRandom rnd = ThreadLocalRandom.current();
+        double rx = rnd.nextDouble(-0.12, 0.12);
+        double rz = rnd.nextDouble(-0.12, 0.12);
+        double yOff = 0.5 + rnd.nextDouble(-0.08, 0.08);
+
         if (clickFace.getAxis().isHorizontal()) {
-            if (targetState.contains(Properties.SLAB_TYPE) && targetState.get(Properties.SLAB_TYPE) == SlabType.TOP) yOff = 0.85;
-            else if (targetState.contains(Properties.BLOCK_HALF) && targetState.get(Properties.BLOCK_HALF) == BlockHalf.TOP) yOff = 0.85;
-            else if (targetState.contains(Properties.SLAB_TYPE) || targetState.contains(Properties.BLOCK_HALF)) yOff = 0.15;
+            if (targetState.contains(Properties.SLAB_TYPE) && targetState.get(Properties.SLAB_TYPE) == SlabType.TOP) yOff = 0.82;
+            else if (targetState.contains(Properties.BLOCK_HALF) && targetState.get(Properties.BLOCK_HALF) == BlockHalf.TOP) yOff = 0.82;
+            else if (targetState.contains(Properties.SLAB_TYPE) || targetState.contains(Properties.BLOCK_HALF)) yOff = 0.18;
         }
-        Vec3d center = new Vec3d(supportPos.getX() + 0.5, supportPos.getY() + yOff, supportPos.getZ() + 0.5);
+        Vec3d center = new Vec3d(supportPos.getX() + 0.5 + rx, supportPos.getY() + yOff, supportPos.getZ() + 0.5 + rz);
         Vec3d hitVec = center.add(Vec3d.of(clickFace.getVector()).multiply(0.5));
         return new BlockHitResult(hitVec, clickFace, supportPos, false);
     }
@@ -164,15 +176,13 @@ public class AntiSusRotator {
         BlockHitResult hitResult = findValidPlaceHit(client, targetPos, targetState);
         if (hitResult == null) return false;
 
+        player.setSprinting(false);
         ActionResult res = client.interactionManager.interactBlock(player, hand, hitResult);
         player.swingHand(hand);
         recentlyPlaced.put(targetPos.toImmutable(), System.currentTimeMillis());
         return res.isAccepted() || !client.world.getBlockState(targetPos).isAir();
     }
 
-    /**
-     * Do Nuoc hoac Lava vao khoi La (Waterlogged) hoac o Nuoc sau khi da xay xong het block tang do
-     */
     public static boolean placeWaterOrLava(MinecraftClient client, BlockPos targetPos, BlockState expectedState) {
         ClientPlayerEntity player = client.player;
         if (player == null || client.interactionManager == null || client.world == null) return false;
@@ -184,22 +194,17 @@ public class AntiSusRotator {
             hit = new BlockHitResult(Vec3d.ofCenter(targetPos), Direction.UP, targetPos, false);
         } else {
             hit = findValidPlaceHit(client, targetPos, expectedState);
-            if (hit == null) {
-                hit = new BlockHitResult(Vec3d.ofCenter(targetPos), Direction.UP, targetPos, false);
-            }
+            if (hit == null) hit = new BlockHitResult(Vec3d.ofCenter(targetPos), Direction.UP, targetPos, false);
         }
 
         Vec3d hitVec = hit.getPos();
         Vec3d eye = player.getEyePos();
-        double dx = hitVec.x - eye.x;
-        double dy = hitVec.y - eye.y;
-        double dz = hitVec.z - eye.z;
+        double dx = hitVec.x - eye.x, dy = hitVec.y - eye.y, dz = hitVec.z - eye.z;
         double dist = Math.sqrt(dx * dx + dz * dz);
         float yaw = (float) (MathHelper.atan2(dz, dx) * (180.0 / Math.PI)) - 90.0f;
         float pitch = (float) (-(MathHelper.atan2(dy, dist) * (180.0 / Math.PI)));
 
-        float origY = player.getYaw();
-        float origP = player.getPitch();
+        float origY = player.getYaw(), origP = player.getPitch();
         stepSmoothRotation(client, yaw, pitch, 1.0f);
 
         client.interactionManager.interactBlock(player, Hand.MAIN_HAND, hit);
@@ -222,4 +227,5 @@ public class AntiSusRotator {
             case EAST -> new float[]{-90.0f, 0.0f};
         };
     }
-        }
+    }
+            
