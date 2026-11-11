@@ -11,16 +11,15 @@ import net.minecraft.component.DataComponentTypes;
 import net.minecraft.entity.player.PlayerEntity;
 import net.minecraft.item.*;
 import net.minecraft.network.packet.c2s.play.UpdateSelectedSlotC2SPacket;
-import net.minecraft.screen.slot.SlotActionType;
 import net.minecraft.state.property.Properties;
 import net.minecraft.text.Text;
 import net.minecraft.util.*;
-import net.minecraft.util.hit.BlockHitResult;
 import net.minecraft.util.math.*;
 import net.minecraft.world.World;
 import org.lwjgl.glfw.GLFW;
 
 import java.lang.reflect.Field;
+import java.lang.reflect.Modifier;
 import java.util.*;
 import java.util.concurrent.ThreadLocalRandom;
 
@@ -34,123 +33,126 @@ public class BuildBotClient implements ClientModInitializer {
 
     private final CustomPathfinder pathfinder = new CustomPathfinder();
     private final OrderAndSellManager orderSell = new OrderAndSellManager();
-    private BlockPos preparedPos = null;
-    private int retryRound = 0, delayTimer = 0, slotSyncCooldown = 0, easyPlaceCooldown = 0;
-    private boolean openGui = false, wasF10 = false, isBotEating = false;
+    private BlockPos easyPendingPos = null, preparedPos = null;
+    private float savedYaw = 0f, savedPitch = 0f;
+    private boolean hasSavedRot = false, openGui = false, wasF10 = false, isBotEating = false;
+    private int retryRound = 0, delayTimer = 0, slotSync = 0, easyCd = 0;
 
     @Override
     public void onInitializeClient() {
         INSTANCE = this;
         config = BuildBotConfig.load();
-
         ClientSendMessageEvents.ALLOW_CHAT.register(msg -> {
             String s = msg.trim().toLowerCase();
             if (s.equals(".bb") || s.equals("#bb") || s.equals(".ae")) { openGui = true; return false; }
             return true;
         });
-
         ClientPlayConnectionEvents.JOIN.register((h, s, c) -> {
             if (config.autoResumeEnabled && config.hasSavedOrigin && schematic == null) {
                 try { schematic = SchematicData.loadFromFile(config.activeSchematicName); } catch (Exception ignored) {}
             }
         });
-
         ClientTickEvents.START_CLIENT_TICK.register(this::onTick);
     }
 
-    private void onTick(MinecraftClient client) {
-        ClientPlayerEntity player = client.player;
-        if (player == null || client.world == null) return;
-
-        if (slotSyncCooldown > 0) slotSyncCooldown--;
-        if (easyPlaceCooldown > 0) easyPlaceCooldown--;
+    private void onTick(MinecraftClient c) {
+        ClientPlayerEntity p = c.player;
+        if (p == null || c.world == null) return;
+        if (slotSync > 0) slotSync--;
+        if (easyCd > 0) easyCd--;
         if (delayTimer > 0) delayTimer--;
+
+        if (easyPendingPos != null) {
+            BlockState exp = getExpectedState(easyPendingPos);
+            if (exp != null && !exp.isAir()) {
+                boolean snk = AntiSusRotator.requiresSneakToPlace(c, easyPendingPos, exp);
+                if (snk) c.options.sneakKey.setPressed(true);
+                AntiSusRotator.placeBlockSmart(c, easyPendingPos, exp, Hand.MAIN_HAND);
+                if (snk) c.options.sneakKey.setPressed(false);
+            }
+            if (hasSavedRot) { p.setYaw(savedYaw); p.setPitch(savedPitch); hasSavedRot = false; }
+            easyPendingPos = null;
+            easyCd = ThreadLocalRandom.current().nextInt(1, 3);
+            return;
+        }
 
         try {
             long win = GLFW.glfwGetCurrentContext();
             if (win != 0L) {
-                boolean p = GLFW.glfwGetKey(win, GLFW.GLFW_KEY_F10) == GLFW.GLFW_PRESS;
-                if (p && !wasF10 && client.currentScreen == null) client.setScreen(new BuildBotScreen(null));
-                wasF10 = p;
+                boolean k = GLFW.glfwGetKey(win, GLFW.GLFW_KEY_F10) == GLFW.GLFW_PRESS;
+                if (k && !wasF10 && c.currentScreen == null) c.setScreen(new BuildBotScreen(null));
+                wasF10 = k;
             }
         } catch (Throwable ignored) {}
 
-        if (openGui && client.currentScreen == null) { openGui = false; client.setScreen(new BuildBotScreen(null)); return; }
-        if (orderSell.isBusy()) { orderSell.tick(client, config); return; }
-        if (client.currentScreen != null) return;
-        if (config.autoEatEnabled && handleAutoEat(client, player)) return;
+        if (openGui && c.currentScreen == null) { openGui = false; c.setScreen(new BuildBotScreen(null)); return; }
 
-        orderSell.checkAndStartAutoSell(client, config);
-
-        // EASY PLACE SIEU NHANH: Bam hoac giu chuot phai la dat khop ngay lap tuc
-        if (config.easyPlaceEnabled && client.options.useKey.isPressed() && easyPlaceCooldown == 0) {
-            if (tryFastEasyPlace(client, player)) return;
-        }
-
-        if (config.autoBuildEnabled && schematic == null) {
-            syncFromLitematica(client);
-            if (schematic == null) { config.autoBuildEnabled = false; return; }
-        }
-        if (!config.autoBuildEnabled || schematic == null) {
-            pathfinder.stopMovement(client);
+        // Khi dang mo Inventory lay do hoac /order, /sell -> Dung di chuyen va dung chuot that de click
+        if (orderSell.isBusy()) {
+            pathfinder.stopMovement(c);
+            botStatusText = "Dang thao tac chuot trong GUI...";
+            orderSell.tick(c, config);
             return;
         }
 
-        // Luon chay runBuildTick moi tick de nhan vat di chuyen muot ma khong bi ngat quang
-        runBuildTick(client, player);
+        if (c.currentScreen != null) return;
+        if (config.autoEatEnabled && handleAutoEat(c, p)) return;
+        orderSell.checkAndStartAutoSell(c, config);
+
+        if (config.easyPlaceEnabled && c.options.useKey.isPressed() && easyCd == 0 && tryEasyPlace(c, p)) return;
+
+        if (config.autoBuildEnabled && schematic == null) {
+            syncFromLitematica(c);
+            if (schematic == null) { config.autoBuildEnabled = false; return; }
+        }
+        if (!config.autoBuildEnabled || schematic == null) { pathfinder.stopMovement(c); return; }
+
+        runBuildTick(c, p);
     }
 
-    private boolean tryFastEasyPlace(MinecraftClient client, ClientPlayerEntity player) {
-        Vec3d eye = player.getEyePos();
-        Vec3d look = player.getRotationVec(1.0F);
-
-        for (double d = 0.8; d <= 4.5; d += 0.25) {
+    private boolean tryEasyPlace(MinecraftClient c, ClientPlayerEntity p) {
+        Vec3d eye = p.getEyePos(), look = p.getRotationVec(1.0F);
+        for (double d = 0.8; d <= 4.6; d += 0.2) {
             BlockPos pos = BlockPos.ofFloored(eye.add(look.multiply(d)));
-            if (!client.world.getBlockState(pos).isAir()) continue;
-
-            BlockState exp = getExpectedState(pos);
+            BlockState act = c.world.getBlockState(pos), exp = getExpectedState(pos);
             if (exp == null || exp.isAir()) continue;
-            if (AntiSusRotator.findValidPlaceHit(client, pos, exp) == null) continue;
-            if (!equipItem(client, exp)) continue;
 
-            boolean needSneak = AntiSusRotator.requiresSneakToPlace(client, pos, exp);
-            if (needSneak) client.options.sneakKey.setPressed(true);
-
-            // Neu la Observer/Piston/Repeater: Xoay 1 tick roi dat ngay o tick ke tiep de 100% khop huong Server
-            if (AntiSusRotator.needsStrictLookRotation(exp)) {
-                float[] rot = AntiSusRotator.getRequiredRotationForState(pos, exp, player);
-                AntiSusRotator.stepSmoothRotation(client, rot[0], rot[1], 1.0f);
-                if (!pos.equals(preparedPos) || slotSyncCooldown > 0) {
-                    preparedPos = pos;
+            if (needsWater(act, exp)) {
+                if (equipRaw(c, Items.WATER_BUCKET)) {
+                    AntiSusRotator.placeWaterOrLava(c, pos, exp);
+                    easyCd = ThreadLocalRandom.current().nextInt(2, 4);
                     return true;
                 }
-            } else if (slotSyncCooldown > 0) {
-                return true;
+                continue;
             }
+            if (!act.isAir() || AntiSusRotator.findValidPlaceHit(c, pos, exp) == null) continue;
+            if (!equipItem(c, exp)) return true;
 
-            if (AntiSusRotator.placeBlockSmart(client, pos, exp, Hand.MAIN_HAND)) {
-                preparedPos = null;
-                easyPlaceCooldown = 2;
-                if (needSneak) client.options.sneakKey.setPressed(false);
+            if (AntiSusRotator.needsStrictLookRotation(exp)) {
+                savedYaw = p.getYaw(); savedPitch = p.getPitch(); hasSavedRot = true;
+                float[] r = AntiSusRotator.getRequiredRotationForState(pos, exp, p);
+                AntiSusRotator.stepSmoothRotation(c, r[0], r[1], 1.0f);
+                easyPendingPos = pos;
                 return true;
             }
-            if (needSneak) client.options.sneakKey.setPressed(false);
+            boolean snk = AntiSusRotator.requiresSneakToPlace(c, pos, exp);
+            if (snk) c.options.sneakKey.setPressed(true);
+            boolean ok = AntiSusRotator.placeBlockSmart(c, pos, exp, Hand.MAIN_HAND);
+            if (snk) c.options.sneakKey.setPressed(false);
+            if (ok) { easyCd = ThreadLocalRandom.current().nextInt(1, 3); return true; }
         }
         return false;
     }
 
-    private void runBuildTick(MinecraftClient client, ClientPlayerEntity player) {
+    private void runBuildTick(MinecraftClient c, ClientPlayerEntity p) {
         if (currentLayerY >= schematic.height) {
-            config.autoBuildEnabled = false; config.save(); pathfinder.stopMovement(client);
-            botStatusText = "Hoan thanh 100%!";
-            player.sendMessage(Text.literal("§a[BuildBot] Da hoan thanh cong trinh!"), false);
+            config.autoBuildEnabled = false; config.save(); pathfinder.stopMovement(c);
+            p.sendMessage(Text.literal("§a[BuildBot] Hoan thanh 100%!"), false);
             return;
         }
 
         long now = System.currentTimeMillis();
-        List haveItemMissing = new ArrayList();
-        List haveItemReady = new ArrayList();
-        Item missingOrderItem = null;
+        List solidMiss = new ArrayList(), solidReady = new ArrayList(), fluidMiss = new ArrayList();
 
         for (int dy = 0; dy < config.layerHeight && (currentLayerY + dy) < schematic.height; dy++) {
             int y = currentLayerY + dy;
@@ -158,109 +160,113 @@ public class BuildBotClient implements ClientModInitializer {
                 for (int z = 0; z < schematic.length; z++) {
                     BlockPos wp = new BlockPos(config.originX + x, config.originY + y, config.originZ + z);
                     BlockState exp = getExpectedState(wp);
-                    // QUAN TRONG: Bo qua tat ca cac o khong khi (Air) de khong bao gio bi ket!
                     if (exp == null || exp.isAir()) continue;
-
                     Long last = (Long) AntiSusRotator.recentlyPlaced.get(wp);
                     if (last != null && (now - last) < 200L) continue;
 
-                    if (!isMatching(client.world.getBlockState(wp), exp)) {
-                        if (hasItemInInventory(player, getItem(exp))) {
-                            haveItemMissing.add(wp);
-                            if (AntiSusRotator.findValidPlaceHit(client, wp, exp) != null) {
-                                haveItemReady.add(wp);
-                            }
-                        } else if (missingOrderItem == null) {
-                            missingOrderItem = getItem(exp);
+                    BlockState act = c.world.getBlockState(wp);
+                    if (exp.isOf(Blocks.WATER) || exp.isOf(Blocks.LAVA)) {
+                        if (!act.isOf(exp.getBlock())) fluidMiss.add(wp);
+                        continue;
+                    }
+                    if (!isSolidMatch(act, exp)) {
+                        if (hasItem(p, getSolidItem(exp))) {
+                            solidMiss.add(wp);
+                            if (AntiSusRotator.findValidPlaceHit(c, wp, exp) != null) solidReady.add(wp);
                         }
+                    } else if (needsWater(act, exp) && hasItem(p, Items.WATER_BUCKET)) {
+                        fluidMiss.add(wp);
                     }
                 }
             }
         }
 
-        // Neu tang hien tai da dat het cac khoi ma ban co trong tui -> Tu dong len tang Y tiep theo!
-        if (haveItemMissing.isEmpty()) {
-            if (missingOrderItem != null && config.autoOrderEnabled) {
-                orderSell.startOrderFetch(client, missingOrderItem, 32);
-                return;
-            }
-            currentLayerY += config.layerHeight;
-            retryRound = 0;
-            preparedPos = null;
-            botStatusText = "Len tang Y = " + currentLayerY;
-            player.sendMessage(Text.literal("§b[BuildBot] Xong tang! Nhay len tang Y = " + currentLayerY), true);
-            // Nhay len ngay khi chuyen tang
-            if (player.isOnGround()) player.jump();
+        if (solidMiss.isEmpty() && fluidMiss.isEmpty()) {
+            currentLayerY += config.layerHeight; retryRound = 0; preparedPos = null;
+            p.sendMessage(Text.literal("§b[BuildBot] Xong tang! Len Y = " + currentLayerY), true);
+            if (p.isOnGround()) p.jump();
+            delayTimer = ThreadLocalRandom.current().nextInt(3, 6);
             return;
         }
 
-        List pool = haveItemReady.isEmpty() ? haveItemMissing : haveItemReady;
+        if (solidMiss.isEmpty()) {
+            fluidMiss.sort(Comparator.comparingDouble(o -> p.squaredDistanceTo(Vec3d.ofCenter((BlockPos) o))));
+            BlockPos fp = (BlockPos) fluidMiss.get(0);
+            BlockState fe = getExpectedState(fp);
+            if (!pathfinder.tickMoveToTarget(c, fp, config) || delayTimer > 0) return;
+            if (equipRaw(c, fe.isOf(Blocks.LAVA) ? Items.LAVA_BUCKET : Items.WATER_BUCKET) && slotSync == 0) {
+                AntiSusRotator.placeWaterOrLava(c, fp, fe);
+                resetDelay();
+            }
+            return;
+        }
 
-        // Sap xep thong minh: Xay cac khoi xung quanh truoc, chua khoi ngay duoi chan (player.getBlockPos()) lai cuoi cung de nhay len dat!
-        BlockPos playerFoot = player.getBlockPos();
-        pool.sort(Comparator.comparingInt(p -> SchematicData.getDependencyOrder(getExpectedState((BlockPos) p)))
-                .thenComparingDouble(p -> {
-                    BlockPos bp = (BlockPos) p;
-                    double d = player.squaredDistanceTo(Vec3d.ofCenter(bp));
-                    return (bp.getX() == playerFoot.getX() && bp.getZ() == playerFoot.getZ()) ? d + 100.0 : d;
-                }));
+        List pool = solidReady.isEmpty() ? solidMiss : solidReady;
+        pool.sort(Comparator.comparingInt(o -> SchematicData.getDependencyOrder(getExpectedState((BlockPos) o)))
+                .thenComparingDouble(o -> p.squaredDistanceTo(Vec3d.ofCenter((BlockPos) o))));
 
         BlockPos pos = (BlockPos) pool.get(0);
-        BlockState exp = getExpectedState(pos);
-        BlockState act = client.world.getBlockState(pos);
+        BlockState exp = getExpectedState(pos), act = c.world.getBlockState(pos);
 
-        // Neu o do bi dat sai khoi -> Tu dao khoi sai
-        if (!act.isAir() && !act.getFluidState().isStill()) {
-            if (config.autoMineEnabled && client.interactionManager != null) {
-                botStatusText = "Dao khoi sai: " + pos.toShortString();
-                client.interactionManager.updateBlockBreakingProgress(pos, Direction.UP);
-                player.swingHand(Hand.MAIN_HAND);
+        if (solidReady.isEmpty() && AntiSusRotator.findValidPlaceHit(c, pos, exp) == null && c.world.getBlockState(pos.down()).isAir()) {
+            pos = pos.down(); exp = Blocks.COBBLESTONE.getDefaultState();
+        }
+
+        if (!act.isAir() && !act.getFluidState().isStill() && !act.isReplaceable()) {
+            if (config.autoMineEnabled && c.interactionManager != null) {
+                c.interactionManager.updateBlockBreakingProgress(pos, Direction.UP);
+                p.swingHand(Hand.MAIN_HAND);
             }
             return;
         }
 
-        // Di chuyen muot ma (Hoac tu nhay len neu khoi nam ngay duoi chan)
-        if (!pathfinder.tickMoveToTarget(client, pos, config)) {
-            botStatusText = "Di chuyen -> " + pos.toShortString();
+        if (!pathfinder.tickMoveToTarget(c, pos, config)) {
             if (pathfinder.isTimedOut(config.moveTimeoutSeconds)) retryRound++;
             return;
         }
+        if (delayTimer > 0 || !equipItem(c, exp)) return;
 
-        if (delayTimer > 0 || !equipItem(client, exp)) return;
+        c.options.sneakKey.setPressed(AntiSusRotator.requiresSneakToPlace(c, pos, exp));
 
-        boolean needSneak = AntiSusRotator.requiresSneakToPlace(client, pos, exp);
-        client.options.sneakKey.setPressed(needSneak);
+        if (AntiSusRotator.needsStrictLookRotation(exp)) {
+            float[] r = AntiSusRotator.getRequiredRotationForState(pos, exp, p);
+            float oy = p.getYaw(), op = p.getPitch();
+            AntiSusRotator.stepSmoothRotation(c, r[0], r[1], 1.0f);
+            if (!pos.equals(preparedPos) || slotSync > 0) {
+                preparedPos = pos; savedYaw = oy; savedPitch = op; hasSavedRot = true;
+                return;
+            }
+        } else if (slotSync > 0) return;
 
-        float[] rot = AntiSusRotator.getRequiredRotationForState(pos, exp, player);
-        boolean rotDone = AntiSusRotator.stepSmoothRotation(client, rot[0], rot[1], 1.0f);
-
-        // Neu la Observer/Piston/Repeater hoac vua doi slot: Cho 1 tick dong bo voi Server roi dat ngay
-        if (slotSyncCooldown > 0 || (AntiSusRotator.needsStrictLookRotation(exp) && (!rotDone || !pos.equals(preparedPos)))) {
-            preparedPos = pos;
-            return;
-        }
-
-        botStatusText = "Dat: " + exp.getBlock().getName().getString();
-        if (AntiSusRotator.placeBlockSmart(client, pos, exp, Hand.MAIN_HAND)) {
-            resetDelay();
-        }
-        if (needSneak) client.options.sneakKey.setPressed(false);
+        if (AntiSusRotator.placeBlockSmart(c, pos, exp, Hand.MAIN_HAND)) resetDelay();
+        if (hasSavedRot) { p.setYaw(savedYaw); p.setPitch(savedPitch); hasSavedRot = false; }
         preparedPos = null;
     }
 
-    private boolean hasItemInInventory(ClientPlayerEntity p, Item item) {
+    private boolean needsWater(BlockState a, BlockState e) {
+        return e != null && e.contains(Properties.WATERLOGGED) && e.get(Properties.WATERLOGGED)
+                && a.isOf(e.getBlock()) && a.contains(Properties.WATERLOGGED) && !a.get(Properties.WATERLOGGED);
+    }
+
+    private boolean isSolidMatch(BlockState a, BlockState e) {
+        if (e == null || e.isAir()) return true;
+        if (!a.isOf(e.getBlock())) return false;
+        if (e.contains(Properties.FACING) && a.get(Properties.FACING) != e.get(Properties.FACING)) return false;
+        return !e.contains(Properties.HORIZONTAL_FACING) || a.get(Properties.HORIZONTAL_FACING) == e.get(Properties.HORIZONTAL_FACING);
+    }
+
+    private boolean hasItem(ClientPlayerEntity p, Item item) {
         if (item == Items.AIR) return false;
-        for (int i = 0; i < 36; i++) {
-            if (p.getInventory().getStack(i).isOf(item)) return true;
-        }
+        for (int i = 0; i < 36; i++) if (p.getInventory().getStack(i).isOf(item)) return true;
         return false;
     }
 
     public static int getSelectedSlot(PlayerEntity p) {
+        Object inv = p.getInventory();
         try {
-            for (Field f : p.getInventory().getClass().getDeclaredFields()) {
-                if (f.getType() == int.class) {
-                    f.setAccessible(true); int v = f.getInt(p.getInventory());
+            for (Field f : inv.getClass().getDeclaredFields()) {
+                if (!Modifier.isStatic(f.getModifiers()) && !Modifier.isFinal(f.getModifiers()) && f.getType() == int.class) {
+                    f.setAccessible(true); int v = f.getInt(inv);
                     if (v >= 0 && v <= 8) return v;
                 }
             }
@@ -270,26 +276,32 @@ public class BuildBotClient implements ClientModInitializer {
 
     public static void setSelectedSlot(PlayerEntity p, int slot) {
         if (slot < 0 || slot > 8) return;
+        Object inv = p.getInventory();
         try {
-            for (Field f : p.getInventory().getClass().getDeclaredFields()) {
-                if (f.getType() == int.class) {
-                    f.setAccessible(true); int v = f.getInt(p.getInventory());
-                    if (v >= 0 && v <= 8) { f.setInt(p.getInventory(), slot); return; }
+            for (Field f : inv.getClass().getDeclaredFields()) {
+                if (!Modifier.isStatic(f.getModifiers()) && !Modifier.isFinal(f.getModifiers()) && f.getType() == int.class) {
+                    f.setAccessible(true); int v = f.getInt(inv);
+                    if (v >= 0 && v <= 8) { f.setInt(inv, slot); return; }
                 }
             }
         } catch (Throwable ignored) {}
     }
 
-    private Item getItem(BlockState s) {
+    private Item getSolidItem(BlockState s) {
         if (s.isOf(Blocks.WATER)) return Items.WATER_BUCKET;
         if (s.isOf(Blocks.LAVA)) return Items.LAVA_BUCKET;
         if (s.isOf(Blocks.REDSTONE_WIRE)) return Items.REDSTONE;
         return s.getBlock().asItem();
     }
 
-    private boolean equipItem(MinecraftClient c, BlockState s) {
-        Item item = getItem(s);
-        if (item == Items.AIR) return false;
+    private boolean equipItem(MinecraftClient c, BlockState s) { return equipRaw(c, getSolidItem(s)); }
+
+    /**
+     * Neu do nam tren Hotbar -> Doi slot ngau nhien delay.
+     * Neu do nam trong Balo (9..35) -> Mo giao dien Kho do that (InventoryScreen) va dung con tro chuot de lay!
+     */
+    private boolean equipRaw(MinecraftClient c, Item item) {
+        if (item == Items.AIR || c.player == null) return false;
         ClientPlayerEntity p = c.player;
         if (p.getMainHandStack().isOf(item)) return true;
 
@@ -297,17 +309,16 @@ public class BuildBotClient implements ClientModInitializer {
             if (p.getInventory().getStack(i).isOf(item)) {
                 setSelectedSlot(p, i);
                 p.networkHandler.sendPacket(new UpdateSelectedSlotC2SPacket(i));
-                slotSyncCooldown = 1;
+                slotSync = ThreadLocalRandom.current().nextInt(1, 3);
                 return true;
             }
         }
         int cur = getSelectedSlot(p);
         for (int i = 9; i < 36; i++) {
-            if (p.getInventory().getStack(i).isOf(item) && c.interactionManager != null) {
-                c.interactionManager.clickSlot(p.playerScreenHandler.syncId, i, cur, SlotActionType.SWAP, p);
-                p.networkHandler.sendPacket(new UpdateSelectedSlotC2SPacket(cur));
-                slotSyncCooldown = 2;
-                return true;
+            if (p.getInventory().getStack(i).isOf(item)) {
+                pathfinder.stopMovement(c);
+                orderSell.startInventoryFetch(c, i, cur);
+                return false; // Cho GUI mo len va chuot keo do xuong Hotbar xong moi dat tiep
             }
         }
         return false;
@@ -331,7 +342,7 @@ public class BuildBotClient implements ClientModInitializer {
 
     public void syncFromLitematica(MinecraftClient c) {
         SchematicData cap = SchematicData.captureFromLitematica(c, config);
-        if (cap != null) {
+        if (cap != null && c.player != null) {
             schematic = cap; currentLayerY = 0; retryRound = 0;
             c.player.sendMessage(Text.literal("§a[BuildBot] Da nhan Litematica: §e" + SchematicData.getActiveLitematicaName()), false);
         }
@@ -358,15 +369,9 @@ public class BuildBotClient implements ClientModInitializer {
         return schematic == null ? Blocks.AIR.getDefaultState() : schematic.getBlockState(wp.getX() - config.originX, wp.getY() - config.originY, wp.getZ() - config.originZ);
     }
 
-    private boolean isMatching(BlockState a, BlockState e) {
-        if (e == null || e.isAir()) return true;
-        if (!a.isOf(e.getBlock())) return false;
-        if (e.contains(Properties.FACING) && a.get(Properties.FACING) != e.get(Properties.FACING)) return false;
-        if (e.contains(Properties.HORIZONTAL_FACING) && a.get(Properties.HORIZONTAL_FACING) != e.get(Properties.HORIZONTAL_FACING)) return false;
-        return true;
-    }
-
     private void resetDelay() {
-        delayTimer = ThreadLocalRandom.current().nextInt(1, Math.max(2, config.minPlaceDelayTicks) + 1);
+        int min = Math.max(1, config.minPlaceDelayTicks);
+        int max = Math.max(min + 1, config.maxPlaceDelayTicks);
+        delayTimer = ThreadLocalRandom.current().nextInt(min, max + 2);
     }
-    }
+                        }
