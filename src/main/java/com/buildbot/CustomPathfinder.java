@@ -25,7 +25,6 @@ public class CustomPathfinder {
             client.options.leftKey.setPressed(false);
             client.options.rightKey.setPressed(false);
             client.options.jumpKey.setPressed(false);
-            client.options.sneakKey.setPressed(false);
             client.options.sprintKey.setPressed(false);
             isBotMoving = false;
         }
@@ -43,25 +42,30 @@ public class CustomPathfinder {
 
         int layerY = targetPos.getY();
 
-        // 1. Neu dang dung de len chinh o can dat:
-        // Neu xung quanh co khoi dat san thi buoc sang khoi ben canh de dat, neu la vien cuoi cung thi nhay len!
-        if (player.getBoundingBox().intersects(new Box(targetPos).contract(0.04))) {
+        // 1. Neu nhan vat dang dung de len chinh o can dat Hopper/Block:
+        // Neu co khoi ben canh thi lui sang khoi ben canh, neu la o cuoi cung duoi chan thi nhay len!
+        if (player.getBoundingBox().intersects(new Box(targetPos).expand(0.05))) {
             isBotMoving = true;
             BlockPos sideStand = findBestAdjacentStandPos(client, targetPos, layerY);
             if (sideStand != null) {
                 walkTowards(client, player, new Vec3d(sideStand.getX() + 0.5, sideStand.getY() + 1.0, sideStand.getZ() + 0.5));
                 client.options.sneakKey.setPressed(true);
-            } else {
+            } else if (targetPos.equals(player.getBlockPos())) {
                 client.options.forwardKey.setPressed(false);
-                client.options.backKey.setPressed(false);
-                client.options.sneakKey.setPressed(false);
+                client.options.backKey.setPressed(true);
                 client.options.jumpKey.setPressed(true);
                 if (player.isOnGround()) player.jump();
+            } else {
+                // Lui nhe ra ngoai de khong ket Hitbox khi dat Hopper
+                double dx = player.getX() - (targetPos.getX() + 0.5);
+                double dz = player.getZ() - (targetPos.getZ() + 0.5);
+                if (Math.abs(dx) < 0.05 && Math.abs(dz) < 0.05) dx = 1.0;
+                walkTowards(client, player, new Vec3d(player.getX() + dx * 2.0, player.getY(), player.getZ() + dz * 2.0));
             }
             return false;
         }
 
-        // 2. Neu nhan vat dang o duoi thap hon mat khoi da xay -> Leo len dung TREN mat khoi (Y + 1)
+        // 2. Neu trong tang da co khoi dat va phia tren khong bi chan -> Uu tien leo len dung TREN mat khoi (Y + 1)
         BlockPos anyStand = findNearestPlacedBlockInLayer(client, player.getBlockPos(), layerY);
         if (anyStand != null && player.getBlockY() <= layerY) {
             isBotMoving = true;
@@ -76,36 +80,26 @@ public class CustomPathfinder {
             return false;
         }
 
-        // 3. DI CHUYEN TOI SAT TUNG BLOCK CAN DAT (Khoang cach ngang <= 1.65 blocks)
+        // 3. Kiem tra khoang cach: Toi gan khoang 1.15 - 2.45 blocks (khong dung de len khoi) la dung lai de Ngoi xuong dat!
         double dx = (targetPos.getX() + 0.5) - player.getX();
         double dz = (targetPos.getZ() + 0.5) - player.getZ();
         double horizDist = Math.sqrt(dx * dx + dz * dz);
         double eyeDistSq = player.getEyePos().squaredDistanceTo(Vec3d.ofCenter(targetPos));
 
-        // Tim vi tri dung sat canh khoi can dat nhat
-        BlockPos standNextToTarget = findBestAdjacentStandPos(client, targetPos, layerY);
-        boolean reachedClose = (horizDist <= 1.68 && eyeDistSq <= 14.0)
-                || (standNextToTarget != null && player.getBlockPos().equals(standNextToTarget.up()))
-                || (standNextToTarget == null && eyeDistSq <= 16.0);
-
-        if (reachedClose) {
+        if (horizDist <= 2.45 && eyeDistSq <= 16.5) {
             stopMovement(client);
-            if (player.isOnGround() && client.world.getBlockState(player.getBlockPos().down()).isAir()) {
-                client.options.sneakKey.setPressed(true);
-                isBotMoving = true;
-            }
             return true;
         }
 
-        // 4. Buoc di bo truc tiep toi khoi can dat
+        // 4. Di bo toi gan khoi can dat (Khi di chuyen thi dung thang, chi giu Sneak neu sat mep vuc)
         isBotMoving = true;
-        Vec3d walkGoal = (standNextToTarget != null)
-                ? new Vec3d(standNextToTarget.getX() + 0.5, standNextToTarget.getY() + 1.0, standNextToTarget.getZ() + 0.5)
-                : new Vec3d(targetPos.getX() + 0.5, layerY + 1.0, targetPos.getZ() + 0.5);
+        BlockPos standNext = findBestAdjacentStandPos(client, targetPos, layerY);
+        Vec3d walkGoal = (standNext != null)
+                ? new Vec3d(standNext.getX() + 0.5, standNext.getY() + 1.0, standNext.getZ() + 0.5)
+                : new Vec3d(targetPos.getX() + 0.5, player.getY(), targetPos.getZ() + 0.5);
 
         walkTowards(client, player, walkGoal);
 
-        // Giu Sneak khi di sat mep de khong bi roi khoi mat block
         boolean nearEdge = player.isOnGround() && client.world.getBlockState(player.getBlockPos().down()).isAir();
         client.options.sneakKey.setPressed(nearEdge);
 
@@ -119,9 +113,6 @@ public class CustomPathfinder {
         return false;
     }
 
-    /**
-     * Tim khoi da dat nam sat canh targetPos de nhan vat di toi dung ngay sat targetPos
-     */
     private BlockPos findBestAdjacentStandPos(MinecraftClient client, BlockPos targetPos, int layerY) {
         if (client.player == null) return null;
         BlockPos best = null;
@@ -169,7 +160,6 @@ public class CustomPathfinder {
         double dz = target.z - player.getZ();
         float targetYaw = (float) (MathHelper.atan2(dz, dx) * (180.0 / Math.PI)) - 90.0f;
 
-        // Xoay muot theo huong buoc di de nhan vat di thang bang nut W muot ma
         float diffYaw = MathHelper.wrapDegrees(targetYaw - player.getYaw());
         player.setYaw(player.getYaw() + MathHelper.clamp(diffYaw * 0.45f, -35.0f, 35.0f));
 
